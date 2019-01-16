@@ -3,3 +3,6 @@ TryOut.py
 embles IPv4-address itself
 data/*
 config.ini
+.idea/
+__pycache__/
+venv/
