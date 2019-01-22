@@ -1120,7 +1120,7 @@ class EClient(object):
             if orderComboLegsCount:
                 for orderComboLeg in order.orderComboLegs:
                     assert orderComboLeg
-                    flds.append(make_field_handle_empty( orderComboLeg.price))
+                    flds.append(make_field_handle_empty( orderComboLeg.price ))
 
         if self.serverVersion() >= MIN_SERVER_VER_SMART_COMBO_ROUTING_PARAMS and contract.secType == "BAG":
                 smartComboRoutingParamsCount = len(order.smartComboRoutingParams) if order.smartComboRoutingParams else 0

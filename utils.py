@@ -5,11 +5,13 @@ import pytz
 import time
 import yagmail
 import configparser
+import numpy as np
 from pandas import Timestamp
 import pandas_market_calendars as mcal
 from Laduc_SQL import SQLClient as RSQL
 from datetime import datetime, timedelta
 from Laduc_WordPress import WordPressClientInit as WPInit
+import cachetools
 
 DEV_MODE = True
 # Set to None to automatically determine DEV_MODE (default True if on local machine).
@@ -218,6 +220,13 @@ def get_parsed_option_tactic(t, self):
     self.expiry_day = ensure_two_digit_int_str(self.expiry_day)
 
 
+def get_closest_value_from_list(value, options):
+    closest = min(options, key=lambda x: abs(x - value))
+    for idx, opt in enumerate(options):
+        if opt == closest:
+            return idx, closest
+
+
 def ensure_int_from_pct(x):
     return int_or_0(ensure_price(x))
 
@@ -328,6 +337,7 @@ def now_is_rth():
 
 def is_localtime_old(local_time, old_seconds=60):
     return local_time < datetime.now() - timedelta(seconds=old_seconds)
+
 
 
 if __name__ == '__main__':
