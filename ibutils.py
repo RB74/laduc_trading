@@ -102,7 +102,7 @@ def get_ratio2(qtys):
     return ratios
 
 
-def get_bag_contract(legs, ib_app):
+def get_bag_contract(legs, ib_app=None):
     c = Contract()
     c.symbol = ','.join(list(set([leg['symbol'] for leg in legs])))
     c.secType = 'BAG'
@@ -134,8 +134,13 @@ def get_bag_contract(legs, ib_app):
             leg.get('exchange', c.exchange)
         )
         leg['contract'] = leg_contract
+        leg['combo_leg'] = c_leg
         c_leg.__parent_contract = c
-        ib_app.request_leg_id(leg_contract, c_leg)
+        if ib_app is not None:
+            ib_app.request_leg_id(leg_contract, c_leg)
+            leg['_requested'] = True
+        else:
+            leg['_requested'] = False
         log.debug("Combo leg: action='{action}, exchange='{exchange}',"
                   "ratio='{ratio}',expiration='{expiration}',"
                   "symbol='{symbol}', strike='{strike}',"
@@ -182,3 +187,9 @@ class Contract(IBContract):
         if not c.exchange:
             c.exchange = 'SMART'
         return c
+
+    def get_price_key(self, tick_type):
+        return '{}_{}'.format(self.secType, tick_type).lower()
+
+    def get_time_key(self, tick_type):
+        return '{}_time'.format(self.get_price_key(tick_type))

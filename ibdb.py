@@ -9,8 +9,12 @@ We need to have a few pieces of data stored in one place with persistence.
 
 import os
 import utils
+import ibutils
+import functools
 from time import sleep
-from ibtrade import Trade
+from ibtrade import Trade, get_data_entry_trades, TradeSheet, MAP_10_SEC
+from ibapi.contract import ComboLeg
+from ibapi.order import Order
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, and_, Column, String, Integer, Float, DateTime, ForeignKey
 from sqlalchemy.orm import sessionmaker, scoped_session, relationship
@@ -25,8 +29,21 @@ class OrderStatus:
     ERROR = 'error'
 
 
-EVAL_INTERVAL = utils.config['ib'].getinteger('eval_interval', 30)
+EVAL_INTERVAL = utils.config['ib'].getint('eval_interval', 30)
 Base = declarative_base()
+
+
+class IbContract(Base):
+    __tablename__ = 'ib_contracts'
+
+    id = Column(Integer, primary_key=True)
+    contract_id = Column(String)
+    parent_contract_id = Column(String, ForeignKey('ib_contracts.ib_contract_id'))
+    ib_contract_id = Column(Integer)
+    symbol = Column(String)
+    sec_type = Column(String)
+    parent_contract = relationship('IbContract', remote_side=[ib_contract_id])
+    child_contracts = relationship('IbContract', backref='children')
 
 
 class IbPrice(Base):
@@ -37,6 +54,21 @@ class IbPrice(Base):
     price = Column(Float, nullable=False, primary_key=True)
     bid = Column(Float)
     ask = Column(Float)
+
+class IbExecution(Base):
+    __tablename__ = 'ib_executions'
+
+    exec_id = Column(String, primary_key=True)
+    order_id = Column(Integer, ForeignKey('ib_orders.request_id'))
+    client_id = Column(Integer)
+    server_time = Column(String)
+    acc_number = Column(String)
+    exchange = Column(String)
+    side = Column(String)
+    shares = Column(Float)
+    price = Column(Float)
+    cum_qty = Column(Float)
+    avg_price = Column(Float)
 
 
 class IbOrder(Base):
@@ -54,21 +86,45 @@ class IbOrder(Base):
     qty = Column(Integer)
     status = Column(String)
     date_added = Column(DateTime, default=datetime.utcnow)
+    date_filled = Column(DateTime)
+    executions = relationship("IbExecution")
+
+    @property
+    def ib_order(self):
+        o = Order()
+        o.totalQuantity = self.qty
+        o.action = self.action
+        o.orderType = 'MKT'
+        return o
 
 
 class IbTradeLeg(Base):
     __tablename__ = 'ib_trade_legs'
-
+    id = Column(Integer, primary_key=True)
     trade_id = Column(Integer, ForeignKey('ib_trades.id'))
+    exchange = Column(String)
+    u_id = Column(String)
     symbol = Column(String)
     action = Column(String)
     ratio = Column(Integer)
     sequence = Column(Integer)
-    contract_id = Column(String)
+    contract_id = Column(String, ForeignKey('ib_contracts.contract_id'))
     ib_contract_id = Column(Integer)
     expiration = Column(Integer)
     date_added = Column(DateTime, default=datetime.utcnow)
-    trade = relationship("IbTrade", foreign_keys=['ib_trades.id'])
+    date_requested = Column(DateTime)
+    trade = relationship("IbTrade")
+    contract = relationship('IbContract')
+
+    @property
+    def ib_combo_leg(self):
+        c = ComboLeg()
+        c.action = self.action
+        c.conId = self.ib_contract_id
+        c.ratio = self.ratio
+        c.expiration = str(self.expiration)
+        c.exchange = self.exchange
+        return c
 
 
 class IbTrade(Base):
@@ -99,12 +155,14 @@ class IbTrade(Base):
     date_entered = Column(DateTime)
     date_exited = Column(DateTime)
     u_id = Column(String)
-    contract_id = Column(String)
-    underlying_contract_id = Column(String)
+    contract_id = Column(String, ForeignKey('IbContract.contract_id'))
+    underlying_contract_id = Column(String, ForeignKey('IbContract.contract_id'))
     date_added = Column(DateTime, default=datetime.utcnow)
 
     legs = relationship("IbTradeLeg")
     orders = relationship("IbOrder")
+    contract = relationship('IbContract')
+    underlying_contract = relationship('IbContract')
 
     @hybrid_property
     def profits_down(self):
@@ -113,6 +171,10 @@ class IbTrade(Base):
     @hybrid_property
     def profits_up(self):
         return self.target_price1 > self.underlying_entry_price
+
+    @hybrid_property
+    def gsheet_trade(self):
+        return Trade.from_ib_trade(self)
 
     @hybrid_property
     def has_pending_order(self):
@@ -200,6 +262,16 @@ class IbTrade(Base):
         except IndexError:
             return None, None
 
+    def __repr__(self):
+        return "<IbTrade(symbol='{}', ul_entry='{}', target1='{}', stop1='{}', date_entered='{}',"\
+                "pos_size='{}')>".format(
+                    self.symbol,
+                    self.underlying_entry_price,
+                    self.target_price1,
+                    self.stop_price1,
+                    self.date_entered,
+                    self.total_qty)
+
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 if not os.path.exists(DATA_DIR):
@@ -207,8 +279,22 @@ if not os.path.exists(DATA_DIR):
 
 DB_PATH = os.path.join(DATA_DIR, 'ib.db')
 
-engine = create_engine("sqlite3:///" + DB_PATH)
+engine = create_engine("sqlite:///" + DB_PATH)
 Session = scoped_session(sessionmaker(bind=engine))
+
+
+def call_with_session(func, *args):
+    session = Session()
+    try:
+        result = func(session, *args)
+    except:
+        session.rollback()
+        raise
+    else:
+        session.commit()
+
+    session.close()
+    return result
 
 
 def delete_old_prices(session):
@@ -295,6 +381,10 @@ def get_orders_by_contract_id(session, contract_id, hours_ago=24):
     ).all()
 
 
+def get_order_by_request_id(session, req_id):
+    return session.query(IbOrder).filter(IbOrder.request_id == req_id).one_or_none()
+
+
 def get_price_by_contract_id(session, contract_id, min_seconds=0):
     criteria = [IbPrice.contract_id == contract_id]
     if min_seconds > 0:
@@ -307,7 +397,7 @@ def get_price_by_contract_id(session, contract_id, min_seconds=0):
 
 
 def get_trade_by_uid(session, uid):
-    return session.query(IbTrade).filter(IbTrade.u_id == str(uid)).one()
+    return session.query(IbTrade).filter(IbTrade.u_id == str(uid)).one_or_none()
 
 
 def maybe_update_trade(sql_trade, sheet_trade):
@@ -331,11 +421,9 @@ def place_orders(session, ib_app):
         return
 
     from ibapi.order import Order
-    from ibtrade import get_data_entry_trades
-    trades = {str(t.u_id): t for t in get_data_entry_trades()}
 
     for order in orders:
-        sheet_trade = trades.get(order.u_id, None)
+        sheet_trade = order.trade.gsheet_trade
         contract = sheet_trade.get_contract()
 
         ib_order = Order()
@@ -348,6 +436,85 @@ def place_orders(session, ib_app):
         session.commit()
 
         ib_app.placeOrder(order.request_id, contract, ib_order)
+
+
+def register_contract(session, contract, parent_id=None):
+    """Registers a new contract (and sub-contracts) """
+    if parent_id is not None:
+        args = and_(IbContract.contract_id == contract.key,
+                    IbContract.parent_contract_id == parent_id)
+    else:
+        args = IbContract.contract_id = contract.key
+    c = session.query(IbContract).filter(args).one_or_none()
+
+    if c is None:
+        c = IbContract()
+        c.contract_id = contract.key
+        c.sec_type = contract.secType
+        c.symbol = contract.symbol
+        c.parent_contract_id = parent_id
+        session.add(c)
+        session.commit()
+
+    combo_legs = getattr(c, 'comboLegs', [])
+
+    for leg in combo_legs:
+        register_contract(session, leg['contract'], c.contract_id)
+
+    return c
+
+
+def register_contract_details(session, contract, details):
+    contracts = session.query(IbContract).filter(IbContract.contract_id == contract.key).all()
+    detail = details[-1]
+    for contract in contracts:
+        contract.ib_contract_id = detail.underConId
+    return contracts
+
+
+def register_executions(session, executions):
+    matches = list()
+
+    for contract, execution in executions:
+        match = session.query(IbExecution).filter(IbExecution.exec_id == execution.execId).one_or_none()
+        if not match:
+            match = IbExecution()
+            match.exec_id = execution.execId
+            match.order_id = execution.orderId
+            match.server_time = execution.time
+            match.acc_number = execution.acctNumber
+            match.exchange = execution.exchange
+            match.side = execution.side
+            match.shares = execution.shares
+            match.price = execution.price
+            match.cum_qty = execution.cumQty
+            match.avg_price = execution.avgPrice
+            session.add(match)
+            session.commit()
+        matches.append(match)
+
+
+
+
+
+def register_ib_contract_id(session, contract_id, ib_contract_id):
+    legs = session.query(IbTradeLeg).filter(and_(IbTradeLeg.contract_id == contract_id,
+                                                 IbTradeLeg.ib_contract_id == None)).all()
+    for leg in legs:
+        leg.ib_contract_id = ib_contract_id
+
+    if legs:
+        session.commit()
+
+
+def register_ib_price(session, contract, price_data):
+    p = IbPrice()
+    p.contract_id = contract.key
+    p.bid = price_data['bid']
+    p.ask = price_data['ask']
+    p.price = price_data['mid']
+    p.time = price_data['bid_time']
+    session.add(p)
 
 
 def register_order(session, trade, action, qty, status=OrderStatus.READY):
@@ -368,12 +535,32 @@ def register_trade(session, trade):
     return _register_trade_from_trade_obj(session, trade)
 
 
-def run_ib_database(ib_app):
+def request_ib_contract_ids(session, ib_app):
+    """Runs process to attach ib_contract_id to each BAG contract."""
+    sql = """SELECT contract_id 
+             FROM ib_contracts 
+             WHERE parent_contract_id IN (SELECT contract_id FROM ib_contracts WHERE sec_type = 'BAG')
+             AND ib_contract_id IS NULL"""
 
+    contract_ids = session.execute(sql).fetchall()
+    if not contract_ids:
+        return
+    ids = [c.contract_id for c in contract_ids]
+    contracts = session.query(IbContract).filter(IbContract.contract_id.in_(ids)).all()
+    callback = functools.partialmethod(register_ib_contract_id, session)
+
+    for db_contract in contracts:
+        ib_app.request_contract_id(db_contract.ib_contract, callback=callback)
+
+
+def run_ib_database(ib_app, Session):
+    """Main method orchestrates ibdb functions to manage trade executions with Interactive Brokers."""
     while True:
         session = Session()
 
         sync_gsheet_trades(session)
+        request_ib_contract_ids(session, ib_app)
+        sync_price_subscriptions(session, ib_app)
         evaluate_trades(session)
         place_orders(session, ib_app)
         delete_old_prices(session)
@@ -384,11 +571,70 @@ def run_ib_database(ib_app):
         sleep(EVAL_INTERVAL)
 
 
-def sync_gsheet_trades(session):
-    from ibtrade import get_data_entry_trades
+def sync_gsheet_trades(session, trade_callbacks=None):
+    """Updates the database with trades from the GSheet."""
     trades = get_data_entry_trades()
+
+    if trade_callbacks:
+        for callback in trade_callbacks:
+            if not callable(callback):
+                callback, args = callback
+                callback(*args, trades)
+            else:
+                callback(trades)
+
     for trade in trades:
         register_trade(session, trade)
+
+
+def sync_price_subscriptions(session, ib_app):
+    """Checks missing price subscriptions on open IbTrades and attempts to subscribe."""
+    current_prices = session.query(IbPrice).filter(
+        IbPrice.time > datetime.utcnow() - timedelta(seconds=60)).all()
+    current_contract_ids = list(set([p.contract_id for p in current_prices]))
+
+    stocks_missing = session.query(IbTrade).filter(
+        and_(IbTrade.underlying_contract_id.notin_(current_contract_ids),
+             IbTrade.date_exited == None)
+    ).all()
+    others_missing = session.query(IbTrade).filter(
+        and_(IbTrade.contract_id.notin_(current_contract_ids),
+             IbTrade.date_exited == None,
+             IbTrade.sec_type != 'BAG')
+    ).all()
+    all_missing = list(stocks_missing) + list(others_missing)
+    u_ids = list()
+
+    for trade in all_missing:
+        if trade.u_id in u_ids:
+            continue
+        ib_app.register_trade(trade.gsheet_trade)
+
+
+def _get_price_data_import(contract, data):
+    """Calculates mid, mid_time prices. If data is returned it should be uploaded to ib_prices."""
+    throttle_key = 'handle_price' + contract.key
+    if MAP_10_SEC.get(throttle_key, None):
+        return
+    MAP_10_SEC[throttle_key] = True
+
+    bid = data.get('bid', None)
+    bid_time = data.get('bid_time', None)
+    ask = data.get('ask', None)
+    ask_time = data.get('ask_time', None)
+
+    if not all((bid, ask)):
+        return
+
+    check_time = datetime.utcnow() - timedelta(seconds=30)
+    if bid_time < check_time or ask_time < check_time:
+        return
+
+    mid = round((bid+ask)/2, 2)
+    data['mid'] = mid
+    data['mid_time'] = check_time
+
+    return data
 
 
 def _register_trade_leg(trade, leg, sequence):
@@ -405,7 +651,7 @@ def _register_trade_leg(trade, leg, sequence):
 
 
 def _register_trade_from_trade_obj(session, trade):
-    if not trade.__tactic_parsed:
+    if not trade.tactic_parsed:
         trade.parse_tactic()
 
     if trade.u_id:
@@ -447,6 +693,63 @@ def _set_sql_trade_from_gsheet_trade(sql_trade, sheet_trade):
     t.underlying_entry_price = trade.underlying_entry_price
     t.underlying_contract_id = sheet_trade.get_stock_contract().key
     t.contract_id = sheet_trade.get_contract().key
+
+
+
+from ib import IbApp, IbAppThreaded, iswrapper, tick_type_map
+
+
+class IbDbApp(IbApp):
+
+    @iswrapper
+    def nextValidId(self, orderId: int):
+        self.nextValidOrderId = orderId
+        if self.subscribe:
+            self.reqAccountUpdates(True, self.account_id)
+            self.request_executions()
+
+    @iswrapper
+    def tickPrice(self, req_id, tick_type, price, attrib):
+        """Track prices in the database (every few seconds)"""
+        tick_type = tick_type_map.get(tick_type, None)
+        if not tick_type:
+            return
+
+        contract = self._contracts_by_req[req_id]
+        data = self.prices[req_id]
+        data[tick_type] = float(price)
+        data[tick_type + '_time'] = datetime.utcnow()
+
+        price = _get_price_data_import(contract, data)
+        if price:
+            call_with_session(register_ib_price, contract, price)
+
+    @iswrapper
+    def contractDetails(self, req_id, details):
+        self._contract_details[req_id].append(details)
+
+    @iswrapper
+    def contractDetailsEnd(self, req_id):
+        contract = self._contracts_by_req.pop(req_id)
+        details = self._contract_details.pop(req_id)
+        call_with_session(register_contract_details, contract, details)
+
+    @iswrapper
+    def execDetails(self, req_id: int, contract, execution):
+        self.executions[req_id].append((contract, execution))
+
+    @iswrapper
+    def execDetailsEnd(self, req_id: int):
+        executions = self.executions.pop(req_id)
+        call_with_session(register_executions, executions)
+
+
+
+
+
+
+
+
 
 
 

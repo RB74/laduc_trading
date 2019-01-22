@@ -4,6 +4,8 @@ import logging
 import gspread
 from cachetools import TTLCache
 from datetime import datetime, timedelta
+from ibutils import (get_stock_contract, get_option_contract,
+                     get_bag_contract, send_closing_trade_notification)
 from oauth2client.service_account import ServiceAccountCredentials
 
 log = logging.getLogger(__name__)
@@ -79,6 +81,7 @@ def get_data_entry_trades(trade_sheet=None, rows=None):
         and row[11]       # Yes date entered
         and not row[12]   # No date exited
     ]
+
 
 class TradeSheet:
     def __init__(self, ib_app=None, refresh_seconds=45):
@@ -334,6 +337,10 @@ class Trade:
         return self.close_reason == STOP_LOSS
 
     @property
+    def tactic_parsed(self):
+        return self.__tactic_parsed
+
+    @property
     def target_reached(self):
         return self.close_reason == TGT_REACHED
 
@@ -447,6 +454,17 @@ class Trade:
         if not t.stop_price:
             t.stop_price = None
 
+        return t
+
+    @staticmethod
+    def from_ib_trade(ib_trade):
+        t = Trade()
+        for key in t.__slots__:
+            value = getattr(ib_trade, key, None)
+            if value is not None:
+                setattr(t, key, value)
+        t.parse_tactic()
+        t._determine_direction()
         return t
 
     def close(self, price, timestamp, qty=None, validate=True, email_only=False):
@@ -610,7 +628,7 @@ class Trade:
         elif self._bag_contract is not None:
             return self._bag_contract
 
-        self._bag_contract = get_bag_contract(self.leg_data, self.sheet.app)
+        self._bag_contract = get_bag_contract(self.leg_data, getattr(self.sheet, 'app', None))
         return self._bag_contract
 
     def get_cash_contract(self):

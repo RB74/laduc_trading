@@ -96,7 +96,9 @@ class IbApp(Wrapper, Client):
         self._contract_ids = dict()
         self._contract_keys_by_req = dict()
         self._contract_success = dict()
+        self._contract_details = defaultdict(list)
         self._trades_w_order = dict()
+        self._callbacks = dict()
         self.executions = defaultdict(list)
 
     @property
@@ -158,12 +160,16 @@ class IbApp(Wrapper, Client):
 
     @iswrapper
     def contractDetails(self, req_id, details):
+
         try:
             leg = self._combo_legs.pop(req_id)
             leg.conId = details.underConId
-            log.debug("Updated comboLeg for {}".format(details.underSymbol))
             contract_key = self._contract_keys_by_req[req_id]
             self._contract_ids[contract_key] = details.underConId
+
+            callback = self._callbacks.pop(req_id, None)
+            if callable(callback):
+                callback(contract_key, details.underConId)
 
             # Check parent's legs..if they all have a conId then reqMktData.
             parent = getattr(leg, '__parent_contract', None)
@@ -190,7 +196,7 @@ class IbApp(Wrapper, Client):
             exec_filter = ExecutionFilter()
         self.reqExecutions(self.next_id(), exec_filter)
 
-    def request_leg_id(self, contract, combo_leg):
+    def request_leg_id(self, contract, combo_leg, callback=None):
         try:
             combo_leg.conId = self._contract_ids[contract.key]
         except KeyError:
@@ -199,9 +205,19 @@ class IbApp(Wrapper, Client):
         req_id = self.next_id()
         self._contract_keys_by_req[req_id] = contract.key
         self._combo_legs[req_id] = combo_leg
+        self._callbacks[req_id] = callback
         self.reqContractDetails(req_id, contract)
+        return req_id
 
-    def register_trade(self, trade):
+    def request_contract_id(self, contract, callback=None):
+        req_id = self.next_id()
+        self._contract_keys_by_req[req_id] = contract.key
+        self._contracts_by_req[req_id] = contract.key
+        self._callbacks[req_id] = callback
+        self.reqContractDetails(req_id, contract)
+        return req_id
+
+    def register_trade(self, trade, force=False):
         """
         Registers a new Trade with IB.
         Possibly requests pricing data for Stock and/or options.
@@ -210,13 +226,14 @@ class IbApp(Wrapper, Client):
         :return: (None)
         """
         contract = trade.get_contract()
-        try:
-            return self._reqs_by_contract_key[contract.key]
-        except KeyError:
-            pass
-        except AttributeError:
-            log.error("Error getting contract for {}".format(trade))
-            return
+        if not force:
+            try:
+                return self._reqs_by_contract_key[contract.key]
+            except KeyError:
+                pass
+            except AttributeError:
+                log.error("Error getting contract for {}".format(trade))
+                return
 
         self._register_contract(contract)
 
@@ -834,6 +851,7 @@ class IbApp(Wrapper, Client):
 
         contract = Contract.from_ib(contract)
         self.executions[req_id].append((contract, execution))
+        execution.cumQty
         data = {
                 'type': 'execution',
                 'order_id': execution.execId,
