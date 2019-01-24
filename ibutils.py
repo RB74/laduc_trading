@@ -1,12 +1,14 @@
 import math
+import pytz
 import utils
 import ibapi
 import logging
+from tzlocal import get_localzone
 from datetime import datetime, timedelta
 import ibapi.connection as ib_connection
 from ibapi.contract import Contract as IBContract, ComboLeg
 log = logging.getLogger(__name__)
-
+LOCAL_TZ = get_localzone()
 
 def clean_ib_package():
     import pkgutil
@@ -45,6 +47,12 @@ def get_stock_contract(symbol, exchange='SMART'):
         c.primaryExchange = 'ISLAND'
     c.currency = 'USD'
     return c
+
+
+def get_utc_from_server_time(t):
+    dt = datetime.strptime(t, '%Y%m%d %H:%M:%S')
+    dt2 = LOCAL_TZ.localize(dt)
+    return dt2.astimezone(pytz.timezone('UTC'))
 
 
 def get_option_contract(symbol, strike, expiration, type, exchange='SMART'):
@@ -169,14 +177,10 @@ class Contract(IBContract):
             return "{}-{}-{}-{}".format(
                 self.symbol,
                 self.lastTradeDateOrContractMonth,
-                self.strike,
-                self.right)
+                self.strike, self.right)
         elif self.secType == 'BAG':
-            return '{}-{}-{}'.format(
-                self.symbol,
-                '-'.join(['{} @ {}'.format(c.action, c.ratio) for c in self.comboLegs]),
-                self.secType
-            )
+            id = '-'.join(['{}/{}/{}'.format(c.action, c.ratio, c.expiration) for c in self.comboLegs])
+            return '{}/{}/{}'.format(self.symbol, self.secType, id)
         else:
             return self.symbol
 

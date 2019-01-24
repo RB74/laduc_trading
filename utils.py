@@ -136,11 +136,11 @@ def main():
 
 def to_timestamp(x):
     if not x:
-        return x
+        return None
     try:
         return Timestamp(x)
     except:
-        return x
+        return None
 
 
 def ensure_price(x):
@@ -148,7 +148,7 @@ def ensure_price(x):
     try:
         return float(x.split(',')[0])
     except ValueError:
-        return x
+        return None
 
 
 def get_prices_list(x, count=3, default=None):
@@ -320,18 +320,32 @@ def now_string():
 
 
 def now_est():
-    t = pytz.timezone('UTC').localize(datetime.utcnow())
+    return utc_to_est(datetime.utcnow())
+
+
+def utc_to_est(x):
+    t = pytz.timezone('UTC').localize(x)
     return t.astimezone(pytz.timezone('US/Eastern'))
 
 
-def now_is_rth():
+def est_to_utc(x):
+    x = to_timestamp(x)
+    if x is None:
+        return x
+    t = pytz.timezone('US/Eastern').localize(x)
+    return t.astimezone(pytz.timezone('UTC'))
 
+def get_seconds_to_market_open():
     est = pytz.timezone('US/Eastern')
     now = datetime.now(est)
     nyse = mcal.get_calendar('NYSE')
     mkt_open = nyse.schedule(now, now + timedelta(days=5))
     next_open = mkt_open.iloc[0]['market_open'].astimezone(est)
-    seconds = (next_open-now).total_seconds()
+    return (next_open - now).total_seconds()
+
+
+def now_is_rth():
+    seconds = get_seconds_to_market_open()
     return seconds < 0
 
 

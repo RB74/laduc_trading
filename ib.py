@@ -209,11 +209,10 @@ class IbApp(Wrapper, Client):
         self.reqContractDetails(req_id, contract)
         return req_id
 
-    def request_contract_id(self, contract, callback=None):
+    def request_contract_id(self, contract):
         req_id = self.next_id()
         self._contract_keys_by_req[req_id] = contract.key
-        self._contracts_by_req[req_id] = contract.key
-        self._callbacks[req_id] = callback
+        self._contracts_by_req[req_id] = contract
         self.reqContractDetails(req_id, contract)
         return req_id
 
@@ -931,12 +930,13 @@ class IbApp(Wrapper, Client):
 
 class IbAppThreaded(Thread):
     def __init__(self, **kwargs):
+        self.cls = kwargs.pop('cls', IbApp)
         self.kwargs = kwargs
         self.app = None
         Thread.__init__(self)
 
     def run(self):
-        self.app = IbApp(**self.kwargs)
+        self.app = self.cls(**self.kwargs)
         self.app.connect()
         self.app.run()
 

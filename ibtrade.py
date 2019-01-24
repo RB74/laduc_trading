@@ -15,11 +15,13 @@ STOP_LOSS = 'Stop loss'
 TGT_REACHED = 'Target reached'
 
 SHEET_TEST_MODE = config['ib'].getboolean('sheet_test_mode', True)
+SHEET_TIME_FMT = '%m/%d/%Y %H:%M'
 PRODUCTION_SHEET_ID = '1p8rr5tmroFuKNyko40jYJmK7PwEGIVHCkPxlW446LIk'
 TEST_SHEET_ID = '1aBxtmUXH2miPi8DigvPEz9kg6kRuTXzhkD61gV9ZLC4'
 MAP_10_SEC = TTLCache(100*100, 10)
 MAP_30_SEC = TTLCache(100*100, 10)
 MAP_30_MIN = TTLCache(100*100, 30*60)
+
 
 if SHEET_TEST_MODE:
     settings_filename = 'ib_cfg_z.json'
@@ -81,6 +83,77 @@ def get_data_entry_trades(trade_sheet=None, rows=None):
         and row[11]       # Yes date entered
         and not row[12]   # No date exited
     ]
+
+
+def close_sheet_trade(u_id, close_pct, price, timestamp, notes):
+    sheet = get_data_entry_sheet()
+    row = sheet.findall(u_id)[0].row
+    new_uid = utils.get_uid()
+
+    sheet.update_cell(row, 10, '{}%'.format(close_pct))  # % Sold
+    sheet.update_cell(row, 11, price)  # Exit Price
+    sheet.update_cell(row, 13, timestamp)  # Date Exited
+    sheet.update_cell(row, 14, notes)  # Notes
+    sheet.update_cell(row, 22, new_uid)  # UID
+
+    return new_uid
+
+
+def close_sheet_trade_partial(u_id, close_pct, price, timestamp, notes):
+    sheet = get_data_entry_sheet()
+    og_row = sheet.findall(u_id)[0].row
+    n_row = og_row + 1
+
+    values = sheet.row_values(og_row, value_render_option='FORMULA')
+    values = values + ['' for _ in range(22 - len(values))]
+
+    utils.replace_sheet_formula_cells(values, og_row, n_row)
+
+    values[9] = '{}%'.format(close_pct)  # % Sold
+    values[10] = '$' + str(price)  # Exit Price
+    values[12] = timestamp  # Date Exited
+    values[13] = notes  # Notes
+    values[21] = utils.get_uid()  # UID
+
+    sheet.insert_row(values, index=n_row, value_input_option='USER_ENTERED')
+
+    return Trade.from_gsheet_row([str(v) for v in values])
+
+
+def highlight_cell(u_id, col_number, row_idx=None, bg_color='red'):
+    assert any((row_idx, u_id))
+
+    from gspread_formatting import CellFormat, format_cell_range, Color
+    from gspread.utils import rowcol_to_a1
+
+    color_map = {'red': Color(1),
+                 'white': Color(1, 1, 1)}
+    color = color_map[bg_color]
+    sheet = get_data_entry_sheet()
+    fmt = CellFormat(backgroundColor=color)
+
+    if u_id:
+        row = sheet.findall(u_id)[0].row
+    else:
+        row = row_idx
+
+    format_cell_range(sheet, rowcol_to_a1(row, col_number), fmt)
+
+
+def open_sheet_trade(u_id, price, timestamp=None):
+    sheet = get_data_entry_sheet()
+
+    try:
+        match = sheet.findall(u_id)[0]
+    except IndexError:
+        return
+
+    sheet.update_cell(match.row, 9, price)
+    if timestamp:
+        sheet.update_cell(match.row, 12, timestamp)
+
+    highlight_cell(u_id, 1, bg_color='white')
+    highlight_cell(u_id, 9, bg_color='white')
 
 
 class TradeSheet:
