@@ -259,6 +259,9 @@ class IbApp(Wrapper, Client):
 
         return req_id
 
+    def register_contract(self, contract):
+        return self._register_contract(contract)
+
     def sync_market_data_subscriptions(self):
         if not now_is_rth():
             log.debug("Skipping market data subscription sync outside of RTH.")

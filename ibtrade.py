@@ -85,6 +85,14 @@ def get_data_entry_trades(trade_sheet=None, rows=None):
     ]
 
 
+def get_sheet_row_by_uid(u_id):
+    sheet = get_data_entry_sheet()
+    try:
+        return sheet.findall(u_id)[0].row
+    except IndexError:
+        pass
+
+
 def close_sheet_trade(u_id, close_pct, price, timestamp, notes):
     sheet = get_data_entry_sheet()
     row = sheet.findall(u_id)[0].row

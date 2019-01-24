@@ -179,7 +179,7 @@ class Contract(IBContract):
                 self.lastTradeDateOrContractMonth,
                 self.strike, self.right)
         elif self.secType == 'BAG':
-            id = '-'.join(['{}/{}/{}'.format(c.action, c.ratio, c.expiration) for c in self.comboLegs])
+            id = '-'.join(['{}/{}'.format(c.action, c.ratio) for c in self.comboLegs])
             return '{}/{}/{}'.format(self.symbol, self.secType, id)
         else:
             return self.symbol
