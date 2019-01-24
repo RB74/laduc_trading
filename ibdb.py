@@ -16,7 +16,7 @@ from ibtrade import Trade, get_data_entry_trades, MAP_10_SEC
 from ibapi.contract import ComboLeg
 from ibapi.order import Order
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine, select, and_, Column, String, Integer, Float, DateTime, ForeignKey
+from sqlalchemy import create_engine, select, func, and_, Column, String, Integer, Float, DateTime, ForeignKey
 from sqlalchemy.orm import sessionmaker, scoped_session, relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.hybrid import hybrid_method, hybrid_property
@@ -78,15 +78,17 @@ class IbTrade(Base):
     u_id = Column(String)
 
     parent_trade_id = Column(Integer, ForeignKey('ib_trades.id'))
-    contract_id = Column(String, ForeignKey('ib_contracts.contract_id'))
-    underlying_contract_id = Column(String, ForeignKey('ib_contracts.contract_id'))
+    contract_id = Column(String)
+    underlying_contract_id = Column(String)
+    contract_pk = Column(Integer, ForeignKey('ib_contracts.id'))
+    underlying_contract_pk = Column(Integer, ForeignKey('ib_contracts.id'))
     date_added = Column(DateTime, default=datetime.utcnow)
     registration_attempts = Column(Integer, default=0)
 
     legs = relationship("IbTradeLeg")
     orders = relationship("IbOrder", back_populates='trade')
-    contract = relationship('IbContract', foreign_keys=[contract_id])
-    underlying_contract = relationship('IbContract', foreign_keys=[underlying_contract_id])
+    contract = relationship('IbContract', foreign_keys=[contract_pk])
+    underlying_contract = relationship('IbContract', foreign_keys=[underlying_contract_pk])
     parent_trade = relationship('IbTrade')
     messages = relationship('IbTradeMessage', back_populates='trade')
 
@@ -278,6 +280,7 @@ class IbContract(Base):
     parent_contract = relationship('IbContract', remote_side=[ib_contract_id])
     child_contracts = relationship('IbContract')
     trade_legs = relationship('IbTradeLeg')
+
     orders = relationship('IbOrder', back_populates='contract')
 
     @hybrid_property
@@ -306,10 +309,16 @@ class IbContract(Base):
         c.exchange = self.exchange
         c.comboLegs = list()
         symbols = list()
-        legs = self.trade_legs
+        criteria = [IbTradeLeg.contract_id == self.contract_id]
         if trade_id:
-            legs = [leg for leg in legs if leg.trade_id == trade_id]
+            criteria = IbTradeLeg.trade_id == trade_id
+
         else:
+            criteria = criteria[0]
+        session = Session.object_session(self)
+        legs = session.query(IbTradeLeg).filter(criteria).all()
+        print("Trade legs available: {}".format(legs))
+        if not trade_id:
             trade_ids = list(set([leg.trade_id for leg in legs]))
             if len(trade_ids) > 1:
                 raise AttributeError("IbContract {} has multiple trade_ids associated. "
@@ -318,7 +327,6 @@ class IbContract(Base):
 
         for leg in sorted(legs, key=lambda t: t.sequence):
             ib_leg = leg.ib_combo_leg
-            symbols.append(ib_leg.symbol)
             c.comboLegs.append(ib_leg)
 
         if symbols:
@@ -415,6 +423,13 @@ class IbOrder(Base):
 
         return valid
 
+    @hybrid_method
+    def get_ib_contract(self, session, trade_id):
+        db_contract = session.query(IbContract).filter(
+            IbContract.contract_id == self.contract_id
+        )
+
+
 
 class IbTradeLeg(Base):
     """ibapi ComboLegs"""
@@ -426,7 +441,8 @@ class IbTradeLeg(Base):
     action = Column(String)
     ratio = Column(Integer)
     sequence = Column(Integer)
-    contract_id = Column(String, ForeignKey('ib_contracts.contract_id'))
+    contract_id = Column(String)
+    contract_pk = Column(Integer, ForeignKey('ib_contracts.id'))
     ib_contract_id = Column(Integer)
     expiration = Column(Integer)
     date_added = Column(DateTime, default=datetime.utcnow)
@@ -454,8 +470,8 @@ class IbTradeLeg(Base):
         c.lastTradeDateOrContractMonth = expiration
         c.strike = strike
         c.right = right
+        c.exchange = 'SMART'
         return c
-
 
 
 def call_with_session(func, *args):
@@ -491,8 +507,15 @@ def evaluate_trades(session, outside_rth=False):
     if not outside_rth and not utils.now_is_rth():
         return
 
-    open_orders = session.query(IbOrder).filter(IbOrder.status == OrderStatus.PLACED).all()
+    open_orders = session.query(IbOrder.trade_id).filter(
+        IbOrder.status == OrderStatus.PLACED).all()
     trade_ids = [o.trade_id for o in open_orders]
+    recent_fills = session.query(IbOrder.trade_id).filter(
+        and_(IbOrder.date_filled > datetime.utcnow() - timedelta(minutes=5),
+             IbOrder.exclude == 0)
+    ).all()
+    trade_ids.extend([o.trade_id for o in recent_fills])
+
     trades = session.query(IbTrade).filter(
         and_(IbTrade.date_exited.is_(None),
              IbTrade.u_id.isnot(None),
@@ -603,6 +626,19 @@ def get_trade_by_uid(session, uid):
     return session.query(IbTrade).filter(IbTrade.u_id == str(uid)).one_or_none()
 
 
+def maybe_request_executions(session, ib_app):
+    max_exec = session.query(func.max(IbExecution.utc_time)).scalar()
+    max_order = session.query(func.max(IbOrder.date_added)).filter(
+        and_(IbOrder.status == OrderStatus.PLACED,
+             IbOrder.exclude == 0)
+    ).scalar()
+    if not max_order:
+        return
+    if not max_exec or max_order >= max_exec:
+        ib_app.request_executions()
+        sleep(3)
+
+
 def maybe_update_or_reset_trade(session, sql_trade: IbTrade, sheet_trade):
     diffs = get_trade_diffs(sql_trade, sheet_trade)
 
@@ -673,12 +709,13 @@ def place_orders(session, ib_app):
     from ibapi.order import Order
 
     for order in orders:
-        contract = order.contract.get_ib_contract(order.trade.id)
+        contract = order.contract.get_ib_contract(order.trade_id)
         combo_legs = getattr(contract, 'comboLegs', None)
         if combo_legs:
             con_ids = [c.conId for c in combo_legs if c.conId]
             if len(con_ids) != len(combo_legs):
                 continue
+        print("contract: {}, combo legs: {}".format(contract, combo_legs))
 
         ib_order = Order()
         ib_order.action = order.action
@@ -724,11 +761,19 @@ def register_contract(session, contract: ibutils.Contract, trade: IbTrade = None
     elif not c.ib_contract_id and contract.conId:
         c.ib_contract_id = contract.conId
 
-    if trade is not None and trade.sec_type == 'BAG':
-        sheet_trade = trade.gsheet_trade
-        sheet_trade.get_contract()
-        for i, leg in enumerate(sheet_trade.leg_data, start=1):
-            _register_trade_leg(session, trade, leg, i)
+    if trade is not None:
+        if trade.sec_type == 'BAG':
+            sheet_trade = trade.gsheet_trade
+            sheet_trade.get_contract()
+            for i, leg in enumerate(sheet_trade.leg_data, start=1):
+                _register_trade_leg(session, trade, leg, i)
+        session.commit()
+        session.expire(trade)
+        api_contract = c.get_ib_contract(trade.id)
+        if trade.contract_id == api_contract.key and not trade.contract_pk:
+            trade.contract_pk = c.id
+        elif trade.underlying_contract_id == api_contract.key and not trade.underlying_contract_pk:
+            trade.underlying_contract_pk = c.id
 
     session.commit()
 
@@ -780,6 +825,12 @@ def register_executions(session, executions):
 
         matches[match.exec_id] = match
     return matches
+
+
+def register_ib_contract_ids(session, _, details):
+    for detail in details:
+        cont = ibutils.Contract.from_ib(detail.contract)
+        register_ib_contract_id(session, cont.key, cont.conId)
 
 
 def register_ib_contract_id(session, contract_id, ib_contract_id):
@@ -930,28 +981,18 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
              IbTrade.date_exited.is_(None),
              IbTrade.registration_attempts <= 3)
     ).all()
-    others_missing = session.query(IbTrade).filter(
-        and_(IbTrade.contract_id.notin_(current_contract_ids),
-             IbTrade.date_exited.is_(None),
-             IbTrade.registration_attempts <= 3
-             )
-    ).all()
-    all_missing = list(stocks_missing) + list(others_missing)
+
     u_ids = list()
 
-    for trade in all_missing:
+    for trade in stocks_missing:
         if trade.u_id in u_ids or not trade.has_valid_legs:
             continue
 
         u_ids.append(trade.u_id)
         sheet_trade = trade.gsheet_trade
-        c1 = sheet_trade.get_contract()
-        c2 = sheet_trade.get_stock_contract()
-
-        for c in (c1, c2):
-            if c and c.key not in current_contract_ids:
-                ib_app.register_contract(c)
-                current_contract_ids.append(c.key)
+        c = sheet_trade.get_stock_contract()
+        ib_app.register_contract(c)
+        current_contract_ids.append(c.key)
 
         trade.registration_attempts += 1
 
@@ -1131,11 +1172,13 @@ def _register_trade_leg(session, trade: IbTrade, leg: dict, sequence: int):
     o.sequence = sequence
     o.contract_id = leg['contract'].key
     trade.legs.append(o)
-    session.commit()
+
 
     req_contract = o.get_request_contract()
-    register_contract(session, req_contract)
-
+    assoc_contract = register_contract(session, req_contract)
+    session.expire(assoc_contract)
+    o.contract_pk = assoc_contract.id
+    session.commit()
 
 def _register_trade_from_trade_obj(session, trade: Trade) -> IbTrade:
     if not trade.tactic_parsed:
@@ -1161,13 +1204,12 @@ def _register_trade_from_trade_obj(session, trade: Trade) -> IbTrade:
 
     session.add(t)
     session.commit()
+    if trade.sec_type == 'BAG':
+        contract1 = trade.get_contract()
+        register_contract(session, contract1, trade=t)
 
-    contract1 = trade.get_contract()
-    register_contract(session, contract1, trade=t)
-
-    if contract1.secType != 'STK':
-        contract2 = trade.get_stock_contract()
-        register_contract(session, contract2, trade=t)
+    contract2 = trade.get_stock_contract()
+    register_contract(session, contract2, trade=t)
 
     return t
 
@@ -1282,7 +1324,7 @@ class IbDbApp(IbApp):
     def contractDetailsEnd(self, req_id):
         contract = self._contracts_by_req.pop(req_id)
         details = self._contract_details.pop(req_id)
-        call_with_session(register_ib_contract_id, contract.key, details[0].underConId)
+        call_with_session(register_ib_contract_ids, contract.key, details)
 
     @iswrapper
     def execDetails(self, req_id: int, contract, execution):
@@ -1307,7 +1349,6 @@ def run_ib_database(ib_app, Session):
     """Executes trade management ibdb functions on an interval."""
     session = Session()
     Base.metadata.create_all(bind=session.bind)
-    ib_app.request_executions()
 
     while utils.get_seconds_to_market_open() < 0:
         session = Session()
@@ -1318,6 +1359,7 @@ def run_ib_database(ib_app, Session):
         sync_opening_orders(session)
         evaluate_trades(session)
         place_orders(session, ib_app)
+        maybe_request_executions(session, ib_app)
         sync_fills(session)
         sync_positions(session)
         sync_invalid_trade_contracts(session)
@@ -1342,6 +1384,10 @@ def run_ibdb_app():
     thread.start()
     sleep(5)
     run_ib_database(thread.app, Session)
+
+    thread.app.disconnect()
+    thread.join()
+
 
 
 if __name__ == '__main__':
