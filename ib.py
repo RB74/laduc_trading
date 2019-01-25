@@ -37,7 +37,37 @@ tick_type_map = {
 }
 STOP_LOSS = 'Stop loss'
 TGT_REACHED = 'Target reached'
+CODES_IB_INTERNAL = [
+    # server errors
+    320,
+    321,
+    322,
+    323,
 
+]
+CODES_IGNORE = [
+    300,  # invalid request_id for cancelMktData
+]
+CODES_PROGRAMMING_ERROR = [
+    160,  # 0 quantity order passed
+    303,  # sshort/slong passed...wtf?
+    311,  # invalid order origin..eh?
+    314,  # NO comboLeg details passed in
+    315,  # comboLeg routing issue - exchange needs to be SMART
+    325,  # exchange/order error
+]
+
+CODES_USER_ERROR = [
+    133,  # submit new order failed
+    138,  # cant parse ticker
+    154,  # security is halted
+    200,  # No security definition found
+    201,  # order rejected
+    203,  # security unavailable for account
+    312,  # Invalid comboLeg details
+    313,  # one comboLeg is invalid
+    392,  # already expired contract
+]
 
 def now_is_rth():
     try:

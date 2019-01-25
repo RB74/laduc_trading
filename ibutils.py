@@ -49,11 +49,27 @@ def get_stock_contract(symbol, exchange='SMART'):
     return c
 
 
+def get_cash_contract(symbol, exchange='IDEALPRO'):
+    c = Contract()
+    c.symbol = symbol
+    c.secType = 'CASH'
+    c.exchange = exchange
+    c.currency = 'USD'
+    return c
+
+
 def get_utc_from_server_time(t):
     dt = datetime.strptime(t, '%Y%m%d %H:%M:%S')
     dt2 = LOCAL_TZ.localize(dt)
     return dt2.astimezone(pytz.timezone('UTC'))
 
+
+def get_option_contract_from_contract_key(contract_id):
+    try:
+        symbol, expiration, strike, right = contract_id.split("-")
+        return get_option_contract(symbol, strike, expiration, right)
+    except:
+        return None
 
 def get_option_contract(symbol, strike, expiration, type, exchange='SMART'):
     """

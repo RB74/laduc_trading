@@ -24,23 +24,16 @@ class ComboLeg(Object):
         self.ratio = 0  # type: int
         self.action = ""      # BUY/SELL/SSHORT
         self.exchange = ""
-        self.openClose = 0   # type: int; LegOpenClose enum values
+        self.openClose = 0   # type: int; # LegOpenClose enum values
         # for stock legs when doing short sale
         self.shortSaleSlot = 0
         self.designatedLocation = ""
         self.exemptCode = -1
 
-
     def __str__(self):
-        return ",".join((
-            str(self.conId),
-            str(self.ratio),
-            str(self.action),
-            str(self.exchange),
-            str(self.openClose),
-            str(self.shortSaleSlot),
-            str(self.designatedLocation),
-            str(self.exemptCode)))
+        return "ComboLeg(conId={}, ratio={}, action={})".format(
+            self.conId, self.ratio, self.action
+        )
 
 
 class DeltaNeutralContract(Object):

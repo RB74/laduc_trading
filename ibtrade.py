@@ -1,7 +1,9 @@
 import os
+from ssl import SSLEOFError
 import utils
 import logging
 import gspread
+from time import sleep
 from cachetools import TTLCache
 from datetime import datetime, timedelta
 from ibutils import (get_stock_contract, get_option_contract,
@@ -50,7 +52,8 @@ def get_data_entry_sheet():
                 MAP_10_SEC.pop('DE_SHEET_VALUES', None)
                 return sheet
 
-            except gspread.exceptions.APIError:
+            except (gspread.exceptions.APIError, SSLEOFError):
+                sleep(1)
                 if i == 2:
                     raise
 
@@ -64,6 +67,7 @@ def now_is_rth():
 
 
 def get_data_entry_rows():
+    log.debug("ibtrade.get_data_entry_rows")
     try:
         return MAP_10_SEC['DE_SHEET_VALUES']
     except KeyError:
@@ -74,7 +78,7 @@ def get_data_entry_rows():
 def get_data_entry_trades(trade_sheet=None, rows=None):
     if not rows:
         rows = get_data_entry_rows()
-
+    log.debug("ibtrade.get_data_entry_trades")
     return [
         Trade.from_gsheet_row(row, trade_sheet, row_idx=idx)
         for idx, row in enumerate(rows, start=2)
@@ -365,12 +369,17 @@ class Trade:
     def closing_side(self):
         return 'BUY' if self.is_short else 'SELL'
 
+    # TODO: Verify all BAG trades are long.
     @property
     def is_long(self):
+        if self.sec_type == 'BAG':
+            return True
         return self.size > 0
 
     @property
     def is_short(self):
+        if self.sec_type == 'BAG':
+            return False
         return self.size < 0
 
     @property
