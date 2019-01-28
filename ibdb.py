@@ -692,9 +692,7 @@ def get_trade_by_uid(session, uid):
 def maybe_request_executions(session, ib_app):
     max_exec = session.query(func.max(IbExecution.utc_time)).scalar()
     max_order = session.query(func.max(IbOrder.date_added)).filter(
-        and_(IbOrder.status == OrderStatus.PLACED,
-             IbOrder.exclude == 0)
-    ).scalar()
+        IbOrder.status == OrderStatus.PLACED).scalar()
     if not max_order:
         return
     if not max_exec or max_order >= max_exec:
@@ -1168,6 +1166,7 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
 
 
 def sync_fills(session):
+
     orders = session.query(IbOrder).filter(IbOrder.status == OrderStatus.PLACED).all()
     for order in orders:
 
