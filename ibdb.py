@@ -300,7 +300,7 @@ class IbPosition(Base):
     position = Column(Float)
     market_price = Column(Float)
     account_name = Column(String, primary_key=True)
-    time = Column(DateTime)
+    time = Column(DateTime, default=datetime.utcnow)
     valid = Column(Integer, default=1)
 
     @hybrid_method
@@ -1051,7 +1051,8 @@ def sync_opening_orders(session):
 
 def sync_positions(session, ib_app):
     positions = session.query(IbPosition).filter(
-        and_(IbPosition.time > datetime.utcnow() - timedelta(minutes=1),
+        and_(
+             IbPosition.time > datetime.utcnow() - timedelta(minutes=10),
              IbPosition.position != 0,
              IbPosition.valid == 1)).all()
 
@@ -1397,10 +1398,6 @@ def _get_price_data_import(contract: ibutils.Contract, data: dict):
     return data
 
 
-
-
-
-
 def _register_trade_leg(session, trade: IbTrade, leg: dict, sequence: int):
     match = [t for t in trade.legs
              if str(t.ratio) == str(leg['ratio'])
@@ -1418,7 +1415,6 @@ def _register_trade_leg(session, trade: IbTrade, leg: dict, sequence: int):
     o.sequence = sequence
     o.contract_id = leg['contract'].key
     trade.legs.append(o)
-
 
     req_contract = o.get_request_contract()
     assoc_contract = register_contract(session, req_contract)
@@ -1613,6 +1609,10 @@ def run_ib_database(ib_app, Session):
     Base.metadata.create_all(bind=session.bind)
 
     while utils.get_seconds_to_market_open() < 0:
+        if ibtrade.get_sheet_test_mode():
+            ibtrade.log.debug("Evaluations paused during test mode.")
+            sleep(EVAL_INTERVAL*5)
+            continue
         session = Session()
 
         sync_gsheet_trades(session)

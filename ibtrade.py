@@ -83,7 +83,9 @@ def get_data_entry_trades(trade_sheet=None, rows=None):
         Trade.from_gsheet_row(row, trade_sheet, row_idx=idx)
         for idx, row in enumerate(rows, start=2)
         if row            # Yes Row w/ data
-        and row[0]        # Yes Symbol
+        and row[1]        # Yes Symbol
+        and row[2]        # Yes position size
+        and row[3]        # Yes tactic
         and row[11]       # Yes date entered
         and not row[12]   # No date exited
     ]
@@ -95,6 +97,15 @@ def get_sheet_row_by_uid(u_id):
         return sheet.findall(u_id)[0].row
     except IndexError:
         pass
+
+
+def get_sheet_test_mode() -> bool:
+    """Returns whether or not the sheet is in 'test mode' (No trade evaluations allowed)."""
+    value = get_data_entry_sheet().row_values(1)[-1]
+    if value not in ('TRUE', 'FALSE'):
+        log.error("ibtrade.get_sheet_test_mode:: expected TRUE/FALSE but instead got '{}'".format(value))
+        return True
+    return value != 'FALSE'
 
 
 def close_sheet_trade(u_id, close_pct, price, timestamp, notes):
@@ -1018,3 +1029,8 @@ class Trade:
                 self.date_entered, self.underlying_entry_price,
                 self.stop_price, self.target_price, self.u_id,
                 getattr(self.get_contract(), 'key', 'N/A'))
+
+
+if __name__ == '__main__':
+    test_mode = get_sheet_test_mode()
+    print(test_mode)
