@@ -23,6 +23,7 @@ from sqlalchemy import create_engine, select, func, and_, or_, Column, String, I
 from sqlalchemy.orm import sessionmaker, scoped_session, relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.hybrid import hybrid_method, hybrid_property
+from sqlalchemy.exc import IntegrityError
 
 
 class OrderStatus:
@@ -54,7 +55,7 @@ Base = declarative_base()
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-engine = create_engine("sqlite:///" + DB_PATH)
+engine = create_engine("sqlite:///" + DB_PATH, echo=True)
 Session = scoped_session(sessionmaker(bind=engine))
 
 
@@ -170,8 +171,15 @@ class IbTrade(Base):
 
     @hybrid_property
     def total_qty(self):
+        orders = self.orders
+        if orders:
+            side = 'BUY' if self.is_long else 'SELL'
+            open_orders = [o for o in orders if o.action == side]
+            if open_orders:
+                return sum([o.qty for o in open_orders])
+
         size = self.size
-        entry = self.entry_price or self.original_entry_price
+        entry = self.original_entry_price or self.entry_price
 
         if not all((entry, size)):
             return None
@@ -417,6 +425,9 @@ class IbExecution(Base):
     price = Column(Float)
     cum_qty = Column(Float)
     avg_price = Column(Float)
+    contract_pk = Column(Integer)
+    contract_id = Column(String)
+
 
 
 class IbOrder(Base):
@@ -480,7 +491,7 @@ class IbOrder(Base):
             if len(store) == 1:
                 valid.append(store[0])
             else:
-                latest = list(sorted(store, key=lambda x: x.correction_id))[-1]
+                latest = list(sorted(store, key=lambda x: x.utc_time))[-1]
                 valid.append(latest)
 
         return valid
@@ -488,14 +499,49 @@ class IbOrder(Base):
     @hybrid_method
     def get_executed_qty(self, execs):
         trade = self.trade
-        total_shares = sum([e.shares for e in execs])
         if trade and trade.sec_type == 'BAG':
-            num_legs = trade.total_legs
-            if len(execs) < num_legs:
+            return self.get_executed_bag_qty(execs, trade)
+        return sum([e.shares for e in execs])
+
+    @hybrid_method
+    def get_executed_bag_qty(self, execs, trade):
+        """Calculates shares traded of each leg and return IbOrder.qty or 0"""
+        for leg in trade.legs:
+            sub_execs = [b for b in execs
+                         if b.contract_id == leg.contract_id]
+            exec_qty = sum([b.shares for b in sub_execs])
+            leg_qty = exec_qty / leg.ratio
+            if leg_qty < self.qty:
+                # All or nothing game
                 return 0
-            else:
-                return total_shares / num_legs
-        return total_shares
+        return self.qty
+
+    @hybrid_method
+    def get_executed_price(self, execs):
+        trade = self.trade
+        if trade and trade.sec_type == 'BAG':
+            return self.get_executed_bag_price(execs, trade)
+        total_price = sum([e.price for e in execs])
+        return total_price / len(execs)
+
+    @hybrid_method
+    def get_executed_bag_price(self, execs, trade):
+        price = 0
+        for leg in trade.legs:
+            sub_execs = [b for b in execs
+                         if b.contract_id == leg.contract_id]
+            if not sub_execs:
+                continue
+            side = sub_execs[0].side
+            avg_price = sum([b.price for b in sub_execs])/len(sub_execs)
+            if side == 'SLD':
+                avg_price = -avg_price
+            price += avg_price
+        return price
+
+
+
+
 
 
 
@@ -549,7 +595,8 @@ def call_with_session(func, *args):
     except Exception as e:
         session.rollback()
         if TEST_MODE or ibtrade.SHEET_TEST_MODE:
-            print(e)
+            print("{} error: {}".format(func.__name__, e))
+            raise
         else:
             raise
     finally:
@@ -701,6 +748,11 @@ def maybe_request_executions(session, ib_app):
 
 
 def maybe_update_or_reset_trade(session, sql_trade: IbTrade, sheet_trade):
+    # 1/25/2019: Sam doesn't want corrections - the trade is the trade so don't fuck up basically...
+    updating_trades = False
+    if not updating_trades:
+        return False
+
     diffs = get_trade_diffs(sql_trade, sheet_trade)
 
     if not diffs:
@@ -736,8 +788,6 @@ def maybe_update_or_reset_trade(session, sql_trade: IbTrade, sheet_trade):
     sql_trade.date_updated = datetime.utcnow()
 
     return sql_trade
-
-
 
 
 def place_orders(session, ib_app):
@@ -837,7 +887,7 @@ def register_executions(session, executions):
     matches = {e.exec_id: e for e in qry.all()}
 
     for contract, execution in executions:
-
+        print(contract.secType, contract.symbol)
         match = matches.get(execution.execId, None)
         if match:
             if not match.utc_time:
@@ -862,6 +912,8 @@ def register_executions(session, executions):
             match.price = execution.price
             match.cum_qty = execution.cumQty
             match.avg_price = execution.avgPrice
+            match.contract_id = contract.key
+            match.contract_pk = contract.conId
 
             session.add(match)
             session.commit()
@@ -929,7 +981,12 @@ def register_ib_price(session, contract, price_data):
     p.ask = price_data['ask']
     p.price = price_data['mid']
     p.time = price_data['bid_time']
-    session.add(p)
+    try:
+        session.add(p)
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+
 
 
 def register_mkt_data_activity(session, req_id):
@@ -982,7 +1039,7 @@ def register_trade(session, trade):
     return _register_trade_from_trade_obj(session, trade)
 
 
-def register_trade_msg(trade, msg):
+def register_trade_msg(trade, msg, update_gsheet=True):
     existing = [t for t in trade.messages
                 if t.text == msg.text
                 and t.status == MsgStatus.OPEN]
@@ -991,6 +1048,12 @@ def register_trade_msg(trade, msg):
         existing[0].date_last_occured = datetime.utcnow()
     else:
         trade.messages.append(msg)
+        if update_gsheet:
+            ibtrade.log_trade_error(
+                trade.symbol,
+                msg.text,
+                trade.u_id,
+                error_code=msg.error_code)
 
 
 def request_ib_contract_ids(session, ib_app):
@@ -1067,6 +1130,7 @@ def sync_positions(session, ib_app):
             ).all()
             if not trades:
                 _register_orphan_position(session, pos)
+            # Avoid monitoring multi-leg contracts.
             continue
 
         for t in trades:
@@ -1099,9 +1163,7 @@ def sync_positions(session, ib_app):
 
 def sync_price_subscriptions(session, ib_app, outside_rth=False):
     """Checks missing price subscriptions on open IbTrades and attempts to subscribe."""
-    if not outside_rth and not utils.now_is_rth():
-        return
-
+    market_open = utils.now_is_rth()
     current_prices = session.query(IbPrice).filter(
         IbPrice.time > datetime.utcnow() - timedelta(minutes=10)).all()
     current_contract_ids = list(set([p.contract_id for p in current_prices]))
@@ -1140,8 +1202,8 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
         sub.active = 1
         sub.request_id = ib_app.register_contract(c)
         current_contract_ids.append(c.key)
-
-        trade.registration_attempts += 1
+        if market_open:
+            trade.registration_attempts += 1
 
     # Drop inactive subscriptions
     active_trades = session.query(IbTrade).filter(
@@ -1174,9 +1236,10 @@ def sync_fills(session):
         qty = order.get_executed_qty(execs)
 
         if abs(qty) < abs(order.qty):
+            print("sync_fills skip: Order ({}) - execs {} - qty {}".format(order.contract_id, len(execs), qty))
             continue
 
-        price = sum([e.avg_price for e in execs])/len(execs)
+        price = order.get_executed_price(execs)
         db_trade = order.trade
         now_utc = max(execs, key=lambda e: e.utc_time).utc_time
 
@@ -1191,6 +1254,7 @@ def sync_fills(session):
                  'entry_price': None,  'exit_price': None,
                  'is_partial': None,   'pct_sold': None, 'notes': None}
 
+        # Compose trade attributes.
         if db_trade.is_long:
             if order.action == 'BUY':
                 attrs['date_entered'] = now_est
@@ -1224,12 +1288,14 @@ def sync_fills(session):
                 attrs['exit_price'] = -price
                 attrs['notes'] = ibtrade.TGT_REACHED if price < db_trade.entry_price else ibtrade.STOP_LOSS
 
+        # Update GSheet
         if attrs['is_partial']:
             sheet_trade_partial = ibtrade.close_sheet_trade_partial(
                 db_trade.u_id, attrs['pct_sold'], attrs['exit_price'],
                 attrs['date_exited'], attrs['notes'])
             db_trade_partial = register_trade(session, sheet_trade_partial)
             db_trade_partial.parent_trade_id = db_trade.id
+            db_trade_partial.status = TradeStatus.CLOSED
         else:
             if attrs['date_exited']:
                 u_id = ibtrade.close_sheet_trade(
@@ -1238,6 +1304,7 @@ def sync_fills(session):
                 db_trade.u_id = str(u_id)
                 db_trade.exit_price = abs(attrs['exit_price'])
                 db_trade.date_exited = now_utc
+                db_trade.status = TradeStatus.CLOSED
             else:
                 ibtrade.open_sheet_trade(
                     db_trade.u_id,
@@ -1571,12 +1638,19 @@ class IbDbApp(IbApp):
 
     @iswrapper
     def execDetails(self, req_id: int, contract, execution):
+        if contract.secType == 'BAG':
+            # We get individual legs
+            # and calculate off that.
+            return
+        contract = ibutils.Contract.from_ib(contract)
         self.executions[req_id].append((contract, execution))
 
     @iswrapper
     def execDetailsEnd(self, req_id: int):
         try:
             executions = self.executions.pop(req_id)
+            if not executions:
+                return
             call_with_session(register_executions, executions)
         except KeyError:
             pass
@@ -1605,9 +1679,12 @@ class IbDbApp(IbApp):
 def run_ib_database(ib_app, Session):
     """Executes trade management ibdb functions on an interval."""
     session = Session()
-    Base.metadata.create_all(bind=session.bind)
 
-    while utils.get_seconds_to_market_open() < 0:
+    Base.metadata.create_all(bind=session.bind)
+    session.commit()
+
+    #while utils.get_seconds_to_market_open() < 0:
+    while True:
         if ibtrade.get_sheet_test_mode():
             ibtrade.log.debug("Evaluations paused during test mode.")
             sleep(EVAL_INTERVAL*5)
@@ -1635,12 +1712,13 @@ def run_ib_database(ib_app, Session):
 
 def run_ibdb_app():
     """Executes IbDbApp/Trade Evaluation threads during current (or next) market hours."""
-    seconds = utils.get_seconds_to_market_open()
-    if seconds > 0:
-        print("run_ibdb_app: {} minutes ({} hours) "
-              "until market open. Starting then.".format(
-               round(seconds/60, 0), round(seconds/60/60), 2))
-        sleep(seconds)
+    if not ib.TRADE_AFTER_HOURS:
+        seconds = utils.get_seconds_to_market_open()
+        if seconds > 0:
+            print("run_ibdb_app: {} minutes ({} hours) "
+                  "until market open. Starting then.".format(
+                   round(seconds/60, 0), round(seconds/60/60), 2))
+            sleep(seconds)
 
     thread = IbAppThreaded(cls=IbDbApp)
     thread.start()

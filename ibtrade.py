@@ -33,23 +33,25 @@ else:
     GSHEET_ID = PRODUCTION_SHEET_ID
 
 
-def get_data_entry_sheet():
+def get_data_entry_sheet(tab_name='DataEntry'):
     """
     Returns the google sheet on a 30-minute cache.
     :return:
     """
+    key = 'DE_SHEET_{}'.format(tab_name)
     try:
-        return MAP_30_MIN['DE_SHEET']
+        return MAP_30_MIN[key]
     except KeyError:
         for i in range(3):
             try:
                 credentials = ServiceAccountCredentials.from_json_keyfile_name(
                     os.path.join(os.path.dirname(__file__), 'service-credentials.json'),
                     ['https://spreadsheets.google.com/feeds'])
-                MAP_30_MIN['DE_SHEET'] = sheet = gspread.authorize(credentials)\
+                MAP_30_MIN[key] = sheet = gspread.authorize(credentials)\
                     .open_by_key(GSHEET_ID)\
-                    .worksheet('DataEntry')
-                MAP_10_SEC.pop('DE_SHEET_VALUES', None)
+                    .worksheet(tab_name)
+                if key.endswith('DataEntry'):
+                    MAP_10_SEC.pop('DE_SHEET_VALUES', None)
                 return sheet
 
             except (gspread.exceptions.APIError, SSLEOFError):
@@ -177,6 +179,16 @@ def open_sheet_trade(u_id, price, timestamp=None):
 
     highlight_cell(u_id, 1, bg_color='white')
     highlight_cell(u_id, 9, bg_color='white')
+
+
+def log_trade_error(symbol, message, u_id, date=None, error_code=None):
+    if date is None:
+        date = utils.now_est()
+    if hasattr(date, 'strftime'):
+        date = date.strftime('%Y-%m-%d %H:%M')
+
+    sheet = get_data_entry_sheet('IBMessages')
+    sheet.append_row([symbol, u_id, date, message, error_code])
 
 
 class TradeSheet:

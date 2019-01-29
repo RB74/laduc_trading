@@ -71,6 +71,7 @@ def get_option_contract_from_contract_key(contract_id):
     except:
         return None
 
+
 def get_option_contract(symbol, strike, expiration, type, exchange='SMART'):
     """
     :param symbol:
@@ -195,7 +196,10 @@ class Contract(IBContract):
                 self.lastTradeDateOrContractMonth,
                 self.strike, self.right)
         elif self.secType == 'BAG':
-            id = '-'.join(['{}/{}'.format(c.action, c.ratio) for c in self.comboLegs])
+            try:
+                id = '-'.join(['{}/{}'.format(c.action, c.ratio) for c in self.comboLegs])
+            except:
+                id = ''
             return '{}/{}/{}'.format(self.symbol, self.secType, id)
         else:
             return self.symbol
@@ -203,7 +207,7 @@ class Contract(IBContract):
     @staticmethod
     def from_ib(ib_contract):
         c = Contract()
-        [setattr(c, k, v) for k, v in ib_contract.__dict__.items() if hasattr(c, k)]
+        [setattr(c, k, v) for k, v in ib_contract.__dict__.items()]
         if not c.exchange:
             c.exchange = 'SMART'
         return c
