@@ -171,6 +171,13 @@ class IbTrade(Base):
 
     @hybrid_property
     def total_qty(self):
+        """
+        Returns the total open quantity.
+        Defaults to the opening order if it exists.
+        Falls back to the IbTrade.original_entry price if it exists.
+        Falls back to the IbTrade.entry_price (if no original)
+        Returns 0 if default and fallbacks don't exist.
+        """
         orders = self.orders
         if orders:
             side = 'BUY' if self.is_long else 'SELL'
@@ -187,10 +194,6 @@ class IbTrade(Base):
             entry *= 100
 
         return round(abs((size*1000)/entry), 0)
-
-    @hybrid_property
-    def total_legs(self):
-        return len(self.contract_id.split('/'))
 
     @hybrid_property
     def stop_qty(self):
@@ -518,26 +521,40 @@ class IbOrder(Base):
 
     @hybrid_method
     def get_executed_price(self, execs):
+        """Returns cost / shares for a group of executions."""
         trade = self.trade
         if trade and trade.sec_type == 'BAG':
             return self.get_executed_bag_price(execs, trade)
-        total_price = sum([e.price for e in execs])
-        return total_price / len(execs)
+
+        total_cost = sum([e.price*e.shares for e in execs])
+        total_shares = sum([e.shares for e in execs])
+
+        price = total_cost/total_shares
+
+        return price
 
     @hybrid_method
     def get_executed_bag_price(self, execs, trade):
+        """Returns contract price of multi-leg order."""
         price = 0
+
         for leg in trade.legs:
             sub_execs = [b for b in execs
                          if b.contract_id == leg.contract_id]
             if not sub_execs:
                 continue
-            side = sub_execs[0].side
-            avg_price = sum([b.price for b in sub_execs])/len(sub_execs)
-            if side == 'SLD':
-                avg_price = -avg_price
-            price += avg_price
+
+            sub_total_cost = sum([b.price*b.shares for b in sub_execs])
+            sub_total_qty = sum([b.shares for b in sub_execs])
+            sub_avg_price = sub_total_cost/sub_total_qty
+            sub_avg_price *= leg.ratio
+
+            if sub_execs[0].side == 'SLD':
+                sub_avg_price = -sub_avg_price
+            price += sub_avg_price
+
         return price
+
 
 
 
@@ -574,8 +591,8 @@ class IbTradeLeg(Base):
         c = ComboLeg()
         c.action = self.action
         c.conId = self.ib_contract_id
-        c.ratio = 1
-        #c.ratio = self.ratio
+        #c.ratio = 1
+        c.ratio = self.ratio
         c.exchange = self.exchange
         return c
 
@@ -1202,8 +1219,10 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
         sub.active = 1
         sub.request_id = ib_app.register_contract(c)
         current_contract_ids.append(c.key)
-        if market_open:
-            trade.registration_attempts += 1
+
+        # TODO: Why DetachedInstanceError?
+        #if market_open:
+        #    trade.registration_attempts += 1
 
     # Drop inactive subscriptions
     active_trades = session.query(IbTrade).filter(
@@ -1228,7 +1247,7 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
 
 
 def sync_fills(session):
-
+    """Processes IbOrders from PLACED to COMPLETE, updating GSheet/IbTrade with details from IbExecutions."""
     orders = session.query(IbOrder).filter(IbOrder.status == OrderStatus.PLACED).all()
     for order in orders:
 
