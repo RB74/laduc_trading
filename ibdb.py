@@ -14,7 +14,7 @@ import ibtrade
 from ibapi.tag_value import TagValue
 from time import sleep
 import ib
-from ib import IbApp, IbAppThreaded, iswrapper, tick_type_map
+from ib import IbApp, IbAppThreaded, iswrapper, tick_type_map, log
 from ibtrade import Trade, get_data_entry_trades, MAP_10_SEC
 from ibapi.contract import ComboLeg
 from ibapi.order import Order
@@ -43,6 +43,7 @@ class TradeStatus:
 class MsgStatus:
     OPEN = 'open'
     RESOLVED = 'resolved'
+    UNKNOWN = 'unknown'
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
@@ -55,7 +56,7 @@ Base = declarative_base()
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-engine = create_engine("sqlite:///" + DB_PATH, echo=True)
+engine = create_engine("sqlite:///" + DB_PATH, echo=False)
 Session = scoped_session(sessionmaker(bind=engine))
 
 
@@ -300,6 +301,11 @@ class IbTradeMessage(Base):
     request_id = Column(Integer)
     trade = relationship('IbTrade', back_populates='messages')
 
+    def __repr__(self):
+        return """IbTradeMessage(trade_id={}, text={}, count={}, error_code={}, date_added={}, date_resolved={}""".format(
+            self.trade_id, self.text, self.count, self.error_code, self.date_added, self.date_resolved
+        )
+
 
 class IbPosition(Base):
     """ibapi portfolio records."""
@@ -428,7 +434,7 @@ class IbExecution(Base):
     price = Column(Float)
     cum_qty = Column(Float)
     avg_price = Column(Float)
-    contract_pk = Column(Integer)
+    ib_contract_id = Column(Integer)
     contract_id = Column(String)
 
 
@@ -465,7 +471,7 @@ class IbOrder(Base):
     @hybrid_property
     def ib_order(self) -> Order:
         o = Order()
-        o.totalQuantity = self.qty
+        o.totalQuantity = self.qty or 0
         o.action = self.action
         o.orderType = 'MKT'
         if self.trade.sec_type == 'BAG':
@@ -530,7 +536,6 @@ class IbOrder(Base):
         total_shares = sum([e.shares for e in execs])
 
         price = total_cost/total_shares
-
         return price
 
     @hybrid_method
@@ -552,15 +557,12 @@ class IbOrder(Base):
             if sub_execs[0].side == 'SLD':
                 sub_avg_price = -sub_avg_price
             price += sub_avg_price
-
         return price
 
-
-
-
-
-
-
+    def __repr__(self):
+        return """IbOrder(contract={}, qty={}, id={}, price={}, time={})""".format(
+            self.contract_id, self.qty, self.request_id, self.price, self.time
+        )
 
 
 class IbTradeLeg(Base):
@@ -625,6 +627,10 @@ def call_with_session(func, *args):
 def delete_old_prices(session):
     condition = IbPrice.time < datetime.utcnow() - timedelta(minutes=20)
     session.query(IbPrice).filter(condition).delete(synchronize_session=False)
+
+
+def delete_old_positions(session):
+    session.query(IbPosition).filter(IbPosition.position == 0).delete(synchronize_session=False)
 
 
 def delete_trade_legs(session, trade_id):
@@ -764,46 +770,32 @@ def maybe_request_executions(session, ib_app):
         sleep(3)
 
 
-def maybe_update_or_reset_trade(session, sql_trade: IbTrade, sheet_trade):
-    # 1/25/2019: Sam doesn't want corrections - the trade is the trade so don't fuck up basically...
-    updating_trades = False
-    if not updating_trades:
+def maybe_update_db_trade(session, sql_trade: IbTrade, sheet_trade):
+    """ Updates stop_price/target_prices"""
+    update_needed = False
+    checks = ('stop_price1',
+              'stop_price2',
+              'target_price1',
+              'target_price2',
+              'target_price3')
+
+    for attr in checks:
+
+        sql_attr = getattr(sql_trade, attr, 0)
+        g_attr = getattr(sheet_trade, attr, 0)
+
+        if sql_attr != g_attr:
+            update_needed = True
+            break
+
+    if not update_needed:
         return False
 
-    diffs = get_trade_diffs(sql_trade, sheet_trade)
+    for attr in checks:
+        new_val = getattr(sheet_trade, attr, None)
+        setattr(sql_trade, attr, new_val)
 
-    if not diffs:
-        return False
-
-    reset_trade = False
-    new_diffs = list()
-
-    for field, sql_val, sheet_val in diffs:
-        if field == 'alert_category':
-            if sheet_val.startswith('#Correction')and not str(sql_val).startswith('#Correction'):
-                reset_trade = True
-            else:
-                sql_trade.alert_category = sheet_val
-        elif sheet_val and field.startswith('target_') or field.startswith('stop_'):
-            setattr(sql_trade, field, float(sheet_val))
-        else:
-            new_diffs.append((field, sql_val, sheet_val))
     session.commit()
-    if not new_diffs:
-        return False
-
-    if reset_trade:
-        ibtrade.log.debug("Resetting trade {}".format(sql_trade))
-        sql_trade = _reset_trade(session, sql_trade, sheet_trade)
-    return sql_trade
-    # TODO: Do we update the trade?
-    # See get_trade_diffs for update fields.
-    # We may need to reset the trade but we should
-    # Wait for a correction...
-    for field, orig_value, new_value in new_diffs:
-        setattr(sql_trade, field, new_value)
-    sql_trade.date_updated = datetime.utcnow()
-
     return sql_trade
 
 
@@ -811,6 +803,10 @@ def place_orders(session, ib_app):
     orders = session.query(IbOrder).filter(
         IbOrder.status == OrderStatus.READY
     ).all()
+    secs_to_open = utils.get_seconds_to_market_open()
+    market_closed = secs_to_open > 0
+    if market_closed and not ib.TRADE_AFTER_HOURS:
+        return
 
     if not orders:
         return
@@ -829,18 +825,11 @@ def place_orders(session, ib_app):
         ib_order = Order()
         ib_order.action = order.action
         ib_order.orderType = 'MKT'
-
-        try:
-            assert order.qty
-            ib_order.totalQuantity = abs(order.qty)
-        except:
-            order.status = OrderStatus.ERROR
-            msg = IbTradeMessage()
-            msg.text = "Invalid order qty ({})".format(order.qty)
-            if order.trade:
-                register_trade_msg(order.trade, msg)
-            session.commit()
-            continue
+        ib_order.totalQuantity = abs(order.qty or 0)
+        if market_closed:
+            if order.contract.sec_type != 'STK':
+                continue
+            ib_order.outsideRth = True
 
         order.request_id = ib_app.next_id()
         order.status = OrderStatus.PLACED
@@ -930,7 +919,7 @@ def register_executions(session, executions):
             match.cum_qty = execution.cumQty
             match.avg_price = execution.avgPrice
             match.contract_id = contract.key
-            match.contract_pk = contract.conId
+            match.ib_contract_id = contract.conId
 
             session.add(match)
             session.commit()
@@ -1005,7 +994,6 @@ def register_ib_price(session, contract, price_data):
         session.rollback()
 
 
-
 def register_mkt_data_activity(session, req_id):
     subscription = session.query(IbMktDataSubscription).filter(
         IbMktDataSubscription.request_id == req_id
@@ -1030,6 +1018,7 @@ def register_order(session, trade, action, qty, request_id=None, exclude=0, stat
 
 
 def register_positions(session, account_name, portfolio):
+    """ callback for IbDbApp.accountDownloadEnd """
     matches = {p.contract_id: p for p in session.query(IbPosition).filter(
                IbPosition.account_name == account_name).all()}
 
@@ -1039,7 +1028,10 @@ def register_positions(session, account_name, portfolio):
             match.position = data['position']
             match.market_price = data['market_price']
             match.time = datetime.utcnow()
+            session.commit()
         except KeyError:
+            if data['position'] == 0:
+                continue
             match = IbPosition()
             match.symbol = data['symbol']
             match.security_type = data['security_type']
@@ -1048,6 +1040,27 @@ def register_positions(session, account_name, portfolio):
             match.account_name = data['account_name']
             match.contract_id = contract_id
             session.add(match)
+
+
+def register_position(session, account_name, contract, position):
+    """ callback for IbDbApp.position """
+    match = session.query(IbPosition).filter(
+        and_(IbPosition.account_name == account_name,
+             IbPosition.contract_id == contract.key)
+    ).one_or_none()
+    if match is None:
+        match = IbPosition()
+        match.contract_id = contract.key
+        match.symbol = contract.symbol
+        match.position = position
+        match.account_name = account_name
+        match.security_type = contract.secType
+        session.add(match)
+    else:
+        match.position = position
+        match.valid = 1
+        match.time = datetime.utcnow()
+        session.commit()
 
 
 def register_trade(session, trade):
@@ -1088,21 +1101,53 @@ def request_ib_contract_ids(session, ib_app):
     session.commit()
 
 
-def sync_gsheet_trades(session, trade_callbacks=None):
+def sync_gsheet_trades(session):
     """Updates the database with trades from the GSheet."""
-    trades = get_data_entry_trades()
     ibtrade.log.debug("Syncing gsheet_trades.")
-
-    if trade_callbacks:
-        for callback in trade_callbacks:
-            if not callable(callback):
-                callback, args = callback
-                callback(*args, trades)
-            else:
-                callback(trades)
+    rows = ibtrade.get_data_entry_rows()
+    trades = get_data_entry_trades(rows=rows)
 
     for trade in trades:
         register_trade(session, trade)
+
+    trades_closed = ibtrade.get_data_entry_trades_closed(
+        rows=rows)
+    if trades_closed:
+        sync_gsheet_manually_closed_trades(session, trades_closed)
+
+
+def sync_gsheet_manually_closed_trades(session, trades):
+    pending_orders = session.query(IbOrder.u_id).filter(
+        and_(IbOrder.status.in_(OrderStatus.PENDING_STATUSES))).all()
+    pending_u_ids = [o.u_id for o in pending_orders]
+    u_ids = [str(t.u_id) for t in trades
+             if str(t.u_id) not in pending_u_ids]
+
+    matches = session.query(IbTrade).filter(
+        and_(
+            IbTrade.u_id.in_(u_ids),
+            IbTrade.u_id.notin_(pending_u_ids),
+            IbTrade.status == TradeStatus.OPEN,
+            IbTrade.date_exited.is_(None))).all()
+    matches = {t.u_id: t for t in matches}
+
+    if not matches:
+        return
+
+    for t in trades:
+        db_trade = matches.get(str(t.u_id), None)
+
+        if not db_trade:
+            continue
+
+        if db_trade.is_long:
+            action = 'SELL'
+            qty = db_trade.total_qty - db_trade.sold_qty
+        else:
+            action = 'BUY'
+            qty = db_trade.total_qty - db_trade.bought_qty
+
+        register_order(session, db_trade, action, qty)
 
 
 def sync_opening_orders(session):
@@ -1127,7 +1172,7 @@ def sync_opening_orders(session):
         register_order(session, t, action, t.total_qty, status=OrderStatus.READY)
 
 
-def sync_positions(session, ib_app):
+def sync_positions(session):
     positions = session.query(IbPosition).filter(
         and_(
              IbPosition.time > datetime.utcnow() - timedelta(minutes=10),
@@ -1246,26 +1291,61 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
     session.commit()
 
 
+def sync_timed_out_orders(session):
+    market_open = utils.now_is_rth()
+    if not market_open:
+        return
+    orders = session.query(IbOrder).filter(
+        and_(IbOrder.status.in_(OrderStatus.PENDING_STATUSES),
+             IbOrder.date_added < datetime.utcnow() - timedelta(minutes=15))
+    ).all()
+
+    for order in orders:
+        order.status = OrderStatus.ERROR
+        trade = order.trade
+
+        if trade is None:
+            continue
+
+        msg = IbTradeMessage()
+        msg.error_code = 99991
+        msg.text = "Execution order time out. Delete/recreate the trade."
+        msg.status = MsgStatus.OPEN
+        register_trade_msg(trade, msg, update_gsheet=True)
+
+        session.commit()
+
+
 def sync_fills(session):
     """Processes IbOrders from PLACED to COMPLETE, updating GSheet/IbTrade with details from IbExecutions."""
     orders = session.query(IbOrder).filter(IbOrder.status == OrderStatus.PLACED).all()
     for order in orders:
+        log.debug("sync_fills: {}".format(order))
 
         execs = order.get_valid_executions()
         qty = order.get_executed_qty(execs)
-
+        log.debug("# of executions: {}".format(len(execs)))
+        log.debug("exec qty: {}".format(qty))
         if abs(qty) < abs(order.qty):
-            print("sync_fills skip: Order ({}) - execs {} - qty {}".format(order.contract_id, len(execs), qty))
+            log.debug("Skipping partially-filled order.".format(order.contract_id, len(execs), qty))
             continue
 
         price = order.get_executed_price(execs)
         db_trade = order.trade
         now_utc = max(execs, key=lambda e: e.utc_time).utc_time
 
+        log.debug("exec price: {} @ {}".format(price, db_trade))
+        position = session.query(IbPosition).filter(IbPosition.contract_id == order.contract_id).one_or_none()
+        if position and abs(position.position) >= order.qty:
+            if order.action == 'BUY':
+                position.position += order.qty
+            else:
+                position.position -= order.qty
+
         if db_trade is None:
             order.status = OrderStatus.COMPLETE
             order.date_filled = now_utc
-            return session.commit()
+            continue
 
         now_est = utils.utc_to_est(now_utc).strftime(ibtrade.SHEET_TIME_FMT)
 
@@ -1286,6 +1366,13 @@ def sync_fills(session):
                 attrs['date_exited'] = now_est
                 attrs['exit_price'] = price
                 attrs['notes'] = ibtrade.TGT_REACHED if price > db_trade.entry_price else ibtrade.STOP_LOSS
+                if db_trade.sec_type == 'BAG':
+                    if db_trade.size < 0:
+                        # credit entry / debit exit
+                        if abs(price) > abs(db_trade.entry_price):
+                            attrs['notes'] = ibtrade.STOP_LOSS
+                        else:
+                            attrs['notes'] = ibtrade.TGT_REACHED
 
             # Assumes all BAG trades are "LONG" to IB. Even when the sub-contracts make the position
             # A technical short trade. (e.g credit trades)
@@ -1306,9 +1393,11 @@ def sync_fills(session):
                 attrs['date_exited'] = now_est
                 attrs['exit_price'] = -price
                 attrs['notes'] = ibtrade.TGT_REACHED if price < db_trade.entry_price else ibtrade.STOP_LOSS
+        log.info("closing attributes: {}".format(attrs))
 
         # Update GSheet
         if attrs['is_partial']:
+            log.debug("Closing partial")
             sheet_trade_partial = ibtrade.close_sheet_trade_partial(
                 db_trade.u_id, attrs['pct_sold'], attrs['exit_price'],
                 attrs['date_exited'], attrs['notes'])
@@ -1316,7 +1405,9 @@ def sync_fills(session):
             db_trade_partial.parent_trade_id = db_trade.id
             db_trade_partial.status = TradeStatus.CLOSED
         else:
+
             if attrs['date_exited']:
+                log.debug("Closing trade.")
                 u_id = ibtrade.close_sheet_trade(
                     db_trade.u_id, attrs['pct_sold'], attrs['exit_price'],
                     attrs['date_exited'], attrs['notes'])
@@ -1325,6 +1416,7 @@ def sync_fills(session):
                 db_trade.date_exited = now_utc
                 db_trade.status = TradeStatus.CLOSED
             else:
+                log.debug("Opening trade.")
                 ibtrade.open_sheet_trade(
                     db_trade.u_id,
                     attrs['entry_price'],
@@ -1334,10 +1426,11 @@ def sync_fills(session):
 
         order.status = OrderStatus.COMPLETE
         order.date_filled = now_utc
-        session.commit()
+    session.commit()
 
 
 def sync_invalid_trades(session):
+
     msgs = session.query(IbTradeMessage).filter(
         and_(IbTradeMessage.status == MsgStatus.OPEN,
              IbTradeMessage.error_code > 0)
@@ -1345,23 +1438,35 @@ def sync_invalid_trades(session):
         IbTrade.status.notin_([TradeStatus.CLOSED, TradeStatus.ERROR])
     ).all()
 
+    if not msgs:
+        return
+
+    log.debug("sync_invalid_trades: {} messages".format(len(msgs)))
     highlight_codes = ib.CODES_USER_ERROR + ib.CODES_PROGRAMMING_ERROR
 
     for msg in msgs:
         trade = msg.trade
         code = msg.error_code
-        row = ibtrade.get_sheet_row_by_uid(trade.u_id)
+        msg.status = MsgStatus.UNKNOWN
+
         if code in ib.CODES_IGNORE:
             continue
         elif code in highlight_codes or 3 < msg.count < 5:
             trade.status = TradeStatus.ERROR
+            row = ibtrade.get_sheet_row_by_uid(trade.u_id)
             ibtrade.highlight_cell(trade.u_id, 4, row, 'red')
+
             if code in ib.CODES_PROGRAMMING_ERROR:
-                utils.send_notification("IB Error", msg, 'zekebarge@gmail.com')
+                utils.send_notification("IB Error", msg.__repr__(), 'zekebarge@gmail.com')
+
         elif code in ib.CODES_IB_INTERNAL:
-            msg.status = MsgStatus.RESOLVED
-            msg.date_resolved = datetime.utcnow()
-            utils.send_notification("IB Error", msg, 'zekebarge@gmail.com')
+            utils.send_notification("IB Error", msg.__repr__(), 'zekebarge@gmail.com')
+        else:
+            continue
+
+        msg.status = MsgStatus.RESOLVED
+        msg.date_resolved = datetime.utcnow()
+
     session.commit()
 
 
@@ -1515,7 +1620,7 @@ def _register_trade_from_trade_obj(session, trade: Trade) -> IbTrade:
     if trade.u_id:
         match = get_trade_by_uid(session, trade.u_id)
         if match:
-            match = maybe_update_or_reset_trade(session, match, trade)
+            match = maybe_update_db_trade(session, match, trade)
             return match
 
     t = IbTrade()
@@ -1527,8 +1632,10 @@ def _register_trade_from_trade_obj(session, trade: Trade) -> IbTrade:
     _set_sql_trade_from_gsheet_trade(t, trade)
 
     if trade.is_short:
-        t.size = -abs(t.size)
-        t.original_entry_price = -abs(t.original_entry_price)
+        if t.size:
+            t.size = -abs(t.size)
+        if t.original_entry_price:
+            t.original_entry_price = -abs(t.original_entry_price)
 
     session.add(t)
     session.commit()
@@ -1616,9 +1723,6 @@ def _split_exec_correction_id(exec_id) -> (str, (None, int)):
         return exec_id, c_id
 
 
-
-
-
 class IbDbApp(IbApp):
 
     @iswrapper
@@ -1680,6 +1784,9 @@ class IbDbApp(IbApp):
             return
         if 'farm is connecting' in error_msg:
             return
+        if error_code == 300:
+            return
+
         data = {'type': 'error',
                 'error_code': error_code,
                 'error_msg': error_msg,
@@ -1694,6 +1801,11 @@ class IbDbApp(IbApp):
         call_with_session(register_positions, account_name, p)
         p.clear()
 
+    @iswrapper
+    def position(self, account: str, contract: ibutils.IBContract, position: float, avgCost: float):
+        contract = ibutils.Contract.from_ib(contract)
+        call_with_session(register_position, account, contract, position)
+
 
 def run_ib_database(ib_app, Session):
     """Executes trade management ibdb functions on an interval."""
@@ -1702,30 +1814,30 @@ def run_ib_database(ib_app, Session):
     Base.metadata.create_all(bind=session.bind)
     session.commit()
 
-    #while utils.get_seconds_to_market_open() < 0:
     while True:
         if ibtrade.get_sheet_test_mode():
             ibtrade.log.debug("Evaluations paused during test mode.")
             sleep(EVAL_INTERVAL*5)
             continue
+
         session = Session()
 
-        sync_gsheet_trades(session)
-        request_ib_contract_ids(session, ib_app)
-        sync_price_subscriptions(session, ib_app)
-        sync_opening_orders(session)
-        evaluate_trades(session)
-        place_orders(session, ib_app)
-        maybe_request_executions(session, ib_app)
-        sync_fills(session)
-        sync_positions(session, ib_app)
-        #sync_invalid_trade_contracts(session)
-        sync_invalid_trades(session)
-        delete_old_prices(session)
+        sync_gsheet_trades(session)                 # Add new trades (and sync manually closed) from GSheet
+        request_ib_contract_ids(session, ib_app)    # Get IB Contract IDs for multi-leg option contracts
+        sync_price_subscriptions(session, ib_app)   # Ensure we're getting market data for open trades
+        sync_opening_orders(session)                # Place orders for newly opened trades
+        evaluate_trades(session)                    # Check targets/stops and set orders for trades to be closed
+        place_orders(session, ib_app)               # Place orders to Interactive Brokers
+        maybe_request_executions(session, ib_app)   # Get executions from Interactive Brokers
+        sync_fills(session)                         # Update GSheet with opening/closing trade info
+        sync_invalid_trades(session)                # Process IbTradeMessages that are errors
+        delete_old_prices(session)                  # Keep ib_prices table clean.
+        delete_old_positions(session)               # Keep ib_positions table clean.
+        sync_positions(session)                     # Close out positions that don't match open trades (SHOULDNT HAPPEN)
+        sync_timed_out_orders(session)              # Cause orders that are open for too long to error out.
 
         session.commit()
         session.close()
-
         sleep(EVAL_INTERVAL)
 
 

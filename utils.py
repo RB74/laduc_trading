@@ -333,7 +333,8 @@ def est_to_utc(x):
     if x is None:
         return x
     t = pytz.timezone('US/Eastern').localize(x)
-    return t.astimezone(pytz.timezone('UTC'))
+    return t.astimezone(pytz.timezone('UTC')).replace(tzinfo=None)
+
 
 def get_seconds_to_market_open():
     est = pytz.timezone('US/Eastern')

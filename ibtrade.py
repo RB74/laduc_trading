@@ -93,6 +93,29 @@ def get_data_entry_trades(trade_sheet=None, rows=None):
     ]
 
 
+def get_data_entry_trades_closed(trade_sheet=None, rows=None, from_utc=None):
+    if not rows:
+        rows = get_data_entry_rows()
+    log.debug("ibtrade.get_data_entry_trades_closed")
+    if not from_utc:
+        from_utc = datetime.utcnow() - timedelta(days=3)
+
+    def _within_time(sheet_time, utc_time):
+        sheet_time = utils.est_to_utc(sheet_time)
+        if not sheet_time:
+            return False
+        return sheet_time >= utc_time
+
+    return [
+        Trade.from_gsheet_row(row, trade_sheet, row_idx=idx)
+        for idx, row in enumerate(rows, start=2)
+        if row
+        and row[10]   # Yes exit price
+        and row[12]   # Yes date exited
+        and _within_time(row[12], from_utc)
+    ]
+
+
 def get_sheet_row_by_uid(u_id):
     sheet = get_data_entry_sheet()
     try:
@@ -158,7 +181,9 @@ def highlight_cell(u_id, col_number, row_idx=None, bg_color='red'):
     fmt = CellFormat(backgroundColor=color)
 
     if u_id:
-        row = sheet.findall(u_id)[0].row
+        row = get_sheet_row_by_uid(u_id)
+        if row is None:
+            return False
     else:
         row = row_idx
 

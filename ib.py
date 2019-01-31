@@ -49,12 +49,13 @@ CODES_IGNORE = [
     300,  # invalid request_id for cancelMktData
 ]
 CODES_PROGRAMMING_ERROR = [
-    160,  # 0 quantity order passed
-    303,  # sshort/slong passed...wtf?
-    311,  # invalid order origin..eh?
-    314,  # NO comboLeg details passed in
-    315,  # comboLeg routing issue - exchange needs to be SMART
-    325,  # exchange/order error
+    160,    # 0 quantity order passed
+    303,    # sshort/slong passed...wtf?
+    311,    # invalid order origin..eh?
+    314,    # NO comboLeg details passed in
+    315,    # comboLeg routing issue - exchange needs to be SMART
+    325,    # exchange/order error
+    99991,  # Internal Order Timeout
 ]
 
 CODES_USER_ERROR = [
@@ -184,7 +185,8 @@ class IbApp(Wrapper, Client):
     def nextValidId(self, orderId: int):
         self.nextValidOrderId = orderId
         if self.subscribe:
-            self.reqAccountUpdates(True, self.account_id)
+            #self.reqAccountUpdates(True, self.account_id)
+            self.reqPositions()
             self.request_executions()
             self.trade_sheet.sync_trades()
 
