@@ -24,6 +24,11 @@ from sqlalchemy.orm import sessionmaker, scoped_session, relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.hybrid import hybrid_method, hybrid_property
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
+
+
+CANCEL_PLACED_ORDERS_ON_START = False
+# Set this to true once to cancel placed orders that didnt execute (e.g after hours)
 
 
 class OrderStatus:
@@ -70,6 +75,7 @@ class IbMktDataSubscription(Base):
     active = Column(Integer, default=0)
     valid = Column(Integer, default=1)
     request_id = Column(Integer, unique=True)
+    date_requested = Column(DateTime)
 
     @hybrid_method
     def cancel_subscription(self, ib_app):
@@ -642,7 +648,7 @@ def evaluate_trades(session, outside_rth=False):
     """Creates an IbOrder for any trade that needs to be closed (partial or full)"""
 
     open_orders = session.query(IbOrder.trade_id).filter(
-        IbOrder.status == OrderStatus.PLACED).all()
+        IbOrder.status.in_(OrderStatus.PENDING_STATUSES)).all()
     trade_ids = [o.trade_id for o in open_orders]
     recent_fills = session.query(IbOrder.trade_id).filter(
         and_(IbOrder.date_filled > datetime.utcnow() - timedelta(minutes=5),
@@ -1063,8 +1069,11 @@ def register_position(session, account_name, contract, position):
         match.valid = 1
         match.checked = 0
         match.time = datetime.utcnow()
-    session.commit()
-
+    try:
+        session.commit()
+    except StaleDataError:
+        session.rollback()
+        return
 
 def register_trade(session, trade):
     if hasattr(trade, '__iter__'):
@@ -1259,16 +1268,22 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
         c = sheet_trade.get_stock_contract()
         try:
             sub = subscriptions_map[trade.underlying_contract_id]
+            if sub.date_requested and sub.date_requested > datetime.utcnow() - timedelta(minutes=15):
+                # Don't request prices more than every 15 minutes.
+                # TODO: Don't request prices at stupid hours.
+                continue
         except KeyError:
             sub = IbMktDataSubscription()
             sub.contract_id = trade.underlying_contract_id
             sub.ib_contract_id = trade.underlying_contract_pk
+            sub.date_requested = datetime.utcnow()
             session.add(sub)
             subscriptions_map[sub.contract_id] = sub
 
         sub.cancel_subscription(ib_app)
         sub.active = 1
         sub.request_id = ib_app.register_contract(c)
+        sub.date_requested = datetime.utcnow()
         current_contract_ids.append(c.key)
 
         # TODO: Why DetachedInstanceError?
@@ -1823,6 +1838,8 @@ def run_ib_database(ib_app, Session):
 
     Base.metadata.create_all(bind=session.bind)
     session.commit()
+    if CANCEL_PLACED_ORDERS_ON_START:
+        ib_app.reqGlobalCancel()
 
     while True:
         if ibtrade.get_sheet_test_mode():
@@ -1831,20 +1848,29 @@ def run_ib_database(ib_app, Session):
             continue
 
         session = Session()
+        funcs = [
+            (sync_gsheet_trades, (session,)),
+            (request_ib_contract_ids, (session, ib_app)),
+            (sync_price_subscriptions, (session, ib_app)),
+            (sync_opening_orders, (session,)),
+            (evaluate_trades, (session,)),
+            (place_orders, (session, ib_app)),
+            (maybe_request_executions, (session, ib_app)),
+            (sync_fills, (session,)),
+            (sync_invalid_trades, (session,)),
+            (delete_old_prices, (session,)),
+            (delete_old_positions, (session,)),
+            (sync_positions, (session,)),
+            (sync_timed_out_orders, (session,))
+        ]
 
-        sync_gsheet_trades(session)                 # Add new trades (and sync manually closed) from GSheet
-        request_ib_contract_ids(session, ib_app)    # Get IB Contract IDs for multi-leg option contracts
-        sync_price_subscriptions(session, ib_app)   # Ensure we're getting market data for open trades
-        sync_opening_orders(session)                # Place orders for newly opened trades
-        evaluate_trades(session)                    # Check targets/stops and set orders for trades to be closed
-        place_orders(session, ib_app)               # Place orders to Interactive Brokers
-        maybe_request_executions(session, ib_app)   # Get executions from Interactive Brokers
-        sync_fills(session)                         # Update GSheet with opening/closing trade info
-        sync_invalid_trades(session)                # Process IbTradeMessages that are errors
-        delete_old_prices(session)                  # Keep ib_prices table clean.
-        delete_old_positions(session)               # Keep ib_positions table clean.
-        sync_positions(session)                     # Close out positions that don't match open trades (SHOULDNT HAPPEN)
-        sync_timed_out_orders(session)              # Cause orders that are open for too long to error out.
+        for func, args in funcs:
+            try:
+                func(*args)
+                session.commit()
+            except Exception as e:
+                log.error("error executing core function {}: {}".format(func.__name__, e))
+                session.rollback()
 
         session.commit()
         session.close()
