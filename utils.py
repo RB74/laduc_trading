@@ -159,21 +159,36 @@ def get_prices_list(x, count=3, default=None):
 
 
 def get_parsed_bag_tactic(t, symbol):
+    t = str(t).upper().strip()
     legs_raw = t.split('/' if '/' in t else ',')
     legs_parsed = []
     for leg in legs_raw:
-        action, md, year, pt, qty = leg.strip().split(' ')
+        try:
+            action, md, year, pt, qty = leg.strip().split(' ')
+            cur_month = None
+        except:
+            action, md, pt, qty = leg.strip().split(' ')
+            _now = datetime.utcnow()
+            cur_month = _now.strftime('%m')
+            while cur_month.startswith('0'):
+                cur_month = cur_month[1:]
+            cur_month = int(cur_month)
+            year = _now.strftime('%Y')
+
         strike = float(''.join(e for e in pt if e.isdigit() or e == '.'))
         side = 'C' if pt.endswith('C') else 'P'
-        day = int(''.join(e for e in md if e.isdigit()))
+        day = ''.join(e for e in md if e.isdigit())
         month = md.replace(str(day), '')
+        month = MONTH_ABV_TO_INT_MAP[month]
+        if cur_month and cur_month > int(month):
+            year = str(int(year) + 1)
 
         legs_parsed.append(
             {
                 'action': 'BUY' if action == 'BOT' else 'SELL',
                 'year': year,
                 'day': ensure_two_digit_int_str(day),
-                'month': MONTH_ABV_TO_INT_MAP[month],
+                'month': month,
                 'strike': strike,
                 'side': side,
                 'symbol': symbol,

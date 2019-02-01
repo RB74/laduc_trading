@@ -319,6 +319,7 @@ class IbPosition(Base):
     account_name = Column(String, primary_key=True)
     time = Column(DateTime, default=datetime.utcnow)
     valid = Column(Integer, default=1)
+    checked = Column(Integer, default=0)
 
     @hybrid_method
     def get_guessed_ib_contract(self):
@@ -385,7 +386,7 @@ class IbContract(Base):
             criteria = criteria[0]
         session = Session.object_session(self)
         legs = session.query(IbTradeLeg).filter(criteria).all()
-        print("Trade legs available: {}".format(legs))
+
         if not trade_id:
             trade_ids = list(set([leg.trade_id for leg in legs]))
             if len(trade_ids) > 1:
@@ -614,7 +615,7 @@ def call_with_session(func, *args):
     except Exception as e:
         session.rollback()
         if TEST_MODE or ibtrade.SHEET_TEST_MODE:
-            print("{} error: {}".format(func.__name__, e))
+            log.error("{}: {}".format(func.__name__, e))
             raise
         else:
             raise
@@ -820,7 +821,7 @@ def place_orders(session, ib_app):
             con_ids = [c.conId for c in combo_legs if c.conId]
             if len(con_ids) != len(combo_legs):
                 continue
-        print("contract: {}, combo legs: {}".format(contract, combo_legs))
+        log.debug("contract: {}, combo legs: {}".format(contract, combo_legs))
 
         ib_order = Order()
         ib_order.action = order.action
@@ -888,12 +889,12 @@ def register_contract_details(session, contract, details):
 
 
 def register_executions(session, executions):
+    log.debug("register_executions")
     exec_ids = [e.execId for _, e in executions]
     qry = session.query(IbExecution).filter(IbExecution.exec_id.in_(exec_ids))
     matches = {e.exec_id: e for e in qry.all()}
 
     for contract, execution in executions:
-        print(contract.secType, contract.symbol)
         match = matches.get(execution.execId, None)
         if match:
             if not match.utc_time:
@@ -1028,7 +1029,7 @@ def register_positions(session, account_name, portfolio):
             match.position = data['position']
             match.market_price = data['market_price']
             match.time = datetime.utcnow()
-            session.commit()
+            match.checked = 0
         except KeyError:
             if data['position'] == 0:
                 continue
@@ -1040,6 +1041,7 @@ def register_positions(session, account_name, portfolio):
             match.account_name = data['account_name']
             match.contract_id = contract_id
             session.add(match)
+        session.commit()
 
 
 def register_position(session, account_name, contract, position):
@@ -1059,8 +1061,9 @@ def register_position(session, account_name, contract, position):
     else:
         match.position = position
         match.valid = 1
+        match.checked = 0
         match.time = datetime.utcnow()
-        session.commit()
+    session.commit()
 
 
 def register_trade(session, trade):
@@ -1177,9 +1180,11 @@ def sync_positions(session):
         and_(
              IbPosition.time > datetime.utcnow() - timedelta(minutes=10),
              IbPosition.position != 0,
-             IbPosition.valid == 1)).all()
+             IbPosition.valid == 1,
+             IbPosition.checked == 0)).all()
 
     for pos in positions:
+        pos.checked = 1
         trades = session.query(IbTrade).filter(
             and_(IbTrade.contract_id == pos.contract_id,
                  IbTrade.date_exited.is_(None),
@@ -1217,10 +1222,11 @@ def sync_positions(session):
             if action:
                 msg = "{} is off by {}".format(t, qty)
                 if TEST_MODE or ibtrade.SHEET_TEST_MODE:
-                    print(msg)
+                    log.error(msg)
                     register_order(session, t, action, qty, exclude=1)
                 else:
-                    raise Exception(msg)
+                    log.error(msg)
+    session.commit()
 
 
 def sync_price_subscriptions(session, ib_app, outside_rth=False):
@@ -1739,11 +1745,13 @@ class IbDbApp(IbApp):
         if not tick_type:
             return
 
+        now = datetime.utcnow()
         contract = self._contracts_by_req[req_id]
         data = self.prices[req_id]
         data[tick_type] = float(price)
-        data[tick_type + '_time'] = datetime.utcnow()
-        print("{} {}: {}".format(contract.key, tick_type, price))
+        data[tick_type + '_time'] = now
+
+        print("{}: {} {}: {}".format(now.strftime('%Y%m%d %H:%M:%S'), contract.key, tick_type, price))
         price = _get_price_data_import(contract, data)
         if price:
             call_with_session(register_ib_price, contract, price)
@@ -1777,6 +1785,7 @@ class IbDbApp(IbApp):
             call_with_session(register_executions, executions)
         except KeyError:
             pass
+        self.reqPositions()
 
     @iswrapper
     def error(self, error_id, error_code, error_msg):
@@ -1793,6 +1802,7 @@ class IbDbApp(IbApp):
                 'time': utils.now_string()}
         msg = "API ERROR: {time}: ({error_code}) {error_msg}".format(**data)
         print(msg)
+        log.error(msg)
         call_with_session(register_ib_error, error_id, error_code, error_msg)
 
     @iswrapper
