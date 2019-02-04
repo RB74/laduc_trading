@@ -31,6 +31,10 @@ CANCEL_PLACED_ORDERS_ON_START = False
 # Set this to true once to cancel placed orders that didnt execute (e.g after hours)
 
 
+SYNC_POSITIONS = False
+# True deletes open trades from IB that don't match an open GSheet trade.
+
+
 class OrderStatus:
     READY = 'ready'
     PLACED = 'placed'
@@ -1191,6 +1195,8 @@ def sync_opening_orders(session):
 
 
 def sync_positions(session):
+    if not SYNC_POSITIONS:
+        return
     positions = session.query(IbPosition).filter(
         and_(
              IbPosition.time > datetime.utcnow() - timedelta(minutes=10),
