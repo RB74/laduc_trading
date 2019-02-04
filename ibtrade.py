@@ -80,7 +80,7 @@ def get_data_entry_rows():
 def get_data_entry_trades(trade_sheet=None, rows=None):
     if not rows:
         rows = get_data_entry_rows()
-    log.debug("ibtrade.get_data_entry_trades")
+    #log.debug("ibtrade.get_data_entry_trades")
     return [
         Trade.from_gsheet_row(row, trade_sheet, row_idx=idx)
         for idx, row in enumerate(rows, start=2)
@@ -96,7 +96,7 @@ def get_data_entry_trades(trade_sheet=None, rows=None):
 def get_data_entry_trades_closed(trade_sheet=None, rows=None, from_utc=None):
     if not rows:
         rows = get_data_entry_rows()
-    log.debug("ibtrade.get_data_entry_trades_closed")
+    #log.debug("ibtrade.get_data_entry_trades_closed")
     if not from_utc:
         from_utc = datetime.utcnow() - timedelta(days=3)
 

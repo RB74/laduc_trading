@@ -651,17 +651,23 @@ def evaluate_trades(session, outside_rth=False):
         IbOrder.status.in_(OrderStatus.PENDING_STATUSES)).all()
     trade_ids = [o.trade_id for o in open_orders]
     recent_fills = session.query(IbOrder.trade_id).filter(
-        and_(IbOrder.date_filled > datetime.utcnow() - timedelta(minutes=5),
+        and_(IbOrder.date_filled > datetime.utcnow() - timedelta(minutes=15),
              IbOrder.exclude == 0)
     ).all()
     trade_ids.extend([o.trade_id for o in recent_fills])
 
-    trades = session.query(IbTrade).filter(
-        and_(IbTrade.date_exited.is_(None),
-             IbTrade.u_id.isnot(None),
-             IbTrade.underlying_contract_id.isnot(None),
-             IbTrade.id.notin_(trade_ids),
-             IbTrade.entry_price.isnot(None))).all()
+    trade_criteria = [
+        IbTrade.date_exited.is_(None),
+        IbTrade.u_id.isnot(None),
+        IbTrade.underlying_contract_id.isnot(None),
+        IbTrade.entry_price.isnot(None)
+    ]
+    if trade_ids:
+        trade_criteria.append(IbTrade.id.notin_(trade_ids))
+    if not utils.now_is_rth():
+        trade_criteria.append(IbTrade.sec_type == 'STK')
+
+    trades = session.query(IbTrade).filter(and_(*trade_criteria)).all()
 
     for t in trades:
 
