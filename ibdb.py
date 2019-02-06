@@ -23,7 +23,7 @@ from sqlalchemy import create_engine, select, func, and_, or_, Column, String, I
 from sqlalchemy.orm import sessionmaker, scoped_session, relationship
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.hybrid import hybrid_method, hybrid_property
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm.exc import StaleDataError
 
 
@@ -44,6 +44,7 @@ class OrderStatus:
 
 
 class TradeStatus:
+    PRE_OPEN_CHECK = 'pre-open-check'
     OPEN = 'open'
     CLOSED = 'closed'
     ERROR = 'error'
@@ -260,7 +261,7 @@ class IbTrade(Base):
 
     @hybrid_method
     def get_next_target(self):
-        action = 'BOT' if self.is_short else 'SLD'
+        action = 'BUY' if self.is_short else 'SELL'
         orders = [order for order in self.orders
                   if order.action == action
                   and order.status != OrderStatus.ERROR
@@ -274,7 +275,7 @@ class IbTrade(Base):
 
     @hybrid_method
     def get_next_stop(self):
-        action = 'BOT' if self.is_short else 'SLD'
+        action = 'BUY' if self.is_short else 'SELL'
         orders = [order for order in self.orders
                   if order.action == action
                   and order.status != OrderStatus.ERROR
@@ -776,6 +777,51 @@ def get_trade_by_uid(session, uid):
     return session.query(IbTrade).filter(IbTrade.u_id == str(uid)).one_or_none()
 
 
+def get_trade_market_price(session, trade, ib_app, raise_gsheet_error=True):
+    """
+    Returns the current market price of a trade (BAG or otherwise)
+    :param session:
+    :param trade:
+    :param ib_app:
+    :param raise_gsheet_error:
+    :return:
+    """
+    if trade.sec_type == 'BAG':
+        legs = trade.legs
+        price = 0
+        for leg in legs:
+            p = get_price_by_contract_id(session, leg.contract_id, min_seconds=60)
+            if p is None:
+                contract = leg.get_request_contract()
+                sub, p = register_market_data_subscription(session, contract, ib_app)
+                if p is None:
+                    if raise_gsheet_error:
+                        msg = IbTradeMessage()
+                        msg.error_code = 99992
+                        msg.text = "Failure to retrieve pricing data for {} " \
+                                   "within 30 seconds. Try again.".format(contract.key)
+                        register_trade_msg(trade, msg, update_gsheet=True)
+                    return 0
+            if leg.action == 'BUY':
+                price += p.price
+            else:
+                price -= p.price
+    else:
+        p = get_price_by_contract_id(session, trade.contract_id, min_seconds=60)
+        if p is None:
+            sub, p = register_market_data_subscription(session, trade.gsheet_trade.get_contract(), ib_app)
+            if p is None:
+                if raise_gsheet_error:
+                    msg = IbTradeMessage()
+                    msg.error_code = 99992
+                    msg.text = "Failure to retrieve pricing data within 30 seconds. " \
+                               "Try again (maybe fix contract details)."
+                    register_trade_msg(trade, msg, update_gsheet=True)
+                return 0
+        price = p.price
+    return price
+
+
 def maybe_request_executions(session, ib_app):
     max_exec = session.query(func.max(IbExecution.utc_time)).scalar()
     max_order = session.query(func.max(IbOrder.date_added)).filter(
@@ -856,6 +902,36 @@ def place_orders(session, ib_app):
 
     sleep(1)
     ib_app.request_executions()
+
+
+def register_market_data_subscription(session, api_contract, ib_app):
+    """Registers a market data subscription with the database and interactive brokers if needed."""
+    contract_id = api_contract.key
+    sub = session.query(IbMktDataSubscription).filter(IbMktDataSubscription.contract_id == contract_id).one_or_none()
+
+    if not sub:
+        sub = IbMktDataSubscription()
+        sub.contract_id = contract_id
+        session.add(sub)
+
+    price = get_price_by_contract_id(session, contract_id, min_seconds=60*5)
+    if not price:
+        if not sub.date_requested or sub.date_requested < datetime.utcnow() - timedelta(minutes=3):
+            sub.request_id = ib_app.register_contract(api_contract)
+            sub.date_requested = datetime.utcnow()
+
+        session.commit()
+        timeout = datetime.now() + timedelta(seconds=30)
+        while datetime.now() < timeout:
+            price = get_price_by_contract_id(session, contract_id, min_seconds=60*5)
+            if price:
+                break
+            sleep(3)
+
+        if not price:
+            # fail the trade w/ message + send error.
+            return sub, None
+    return sub, price
 
 
 def register_contract(session, contract: ibutils.Contract, trade: IbTrade = None, parent_id: int=None):
@@ -1007,7 +1083,7 @@ def register_ib_price(session, contract, price_data):
     try:
         session.add(p)
         session.commit()
-    except IntegrityError:
+    except (OperationalError, IntegrityError):
         session.rollback()
 
 
@@ -1250,9 +1326,54 @@ def sync_positions(session):
     session.commit()
 
 
+def sync_pre_check_trades(session, ib_app):
+    """
+    Moves an IbTrade.status from PRE_OPEN_CHECK to OPEN as long as:
+
+    1) A price can be found for the trade contract(s)
+        - Registers a 99992 error otherwise.
+    2) The original_entry_price (if not null) is within 5% of the market price.
+        - Registers a 9993 error otherwise.
+    Marks TradeStatus.CLOSED when trade.date_exited exists.
+    """
+    trades = session.query(IbTrade).filter(IbTrade.status == TradeStatus.PRE_OPEN_CHECK).all()
+    for trade in trades:
+        if trade.date_exited:
+            trade.status = TradeStatus.CLOSED
+            continue
+
+        og_entry = trade.original_entry_price
+        if not og_entry:
+            # Nothing to pre-check, release trade.
+            trade.status = TradeStatus.OPEN
+            continue
+
+        if not trade.has_valid_legs:
+            # Eventually we should get legs
+            continue
+
+        # Get price of security
+        price = get_trade_market_price(session, trade, ib_app, raise_gsheet_error=True)
+        if not price:
+            continue
+
+        diff = abs(abs(og_entry) - abs(price))
+
+        if diff > 0.05*price:
+            msg = IbTradeMessage()
+            msg.error_code = 99993
+            msg.text = "original entry price ({}) " \
+                       "is more than 5% away from market price ({})".format(og_entry, price)
+            register_trade_msg(trade, msg, update_gsheet=True)
+        else:
+            trade.status = TradeStatus.OPEN
+    session.commit()
+
+
 def sync_price_subscriptions(session, ib_app, outside_rth=False):
     """Checks missing price subscriptions on open IbTrades and attempts to subscribe."""
-    market_open = utils.now_is_rth()
+    open_secs = utils.get_seconds_to_market_open()
+
     current_prices = session.query(IbPrice).filter(
         IbPrice.time > datetime.utcnow() - timedelta(minutes=10)).all()
     current_contract_ids = list(set([p.contract_id for p in current_prices]))
@@ -1298,10 +1419,6 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
         sub.date_requested = datetime.utcnow()
         current_contract_ids.append(c.key)
 
-        # TODO: Why DetachedInstanceError?
-        #if market_open:
-        #    trade.registration_attempts += 1
-
     # Drop inactive subscriptions
     active_trades = session.query(IbTrade).filter(
         and_(IbTrade.date_exited.is_(None),
@@ -1325,9 +1442,12 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
 
 
 def sync_timed_out_orders(session):
-    market_open = utils.now_is_rth()
-    if not market_open:
-        return
+    mins_to_mkt = utils.get_minutes_to_market_open()
+    if mins_to_mkt > 0:
+        return  # Don't process outside of market hours.
+    elif 0 > mins_to_mkt > -30:
+        return   # Allow ~30 mins of market time to fill open orders.
+
     orders = session.query(IbOrder).filter(
         and_(IbOrder.status.in_(OrderStatus.PENDING_STATUSES),
              IbOrder.date_added < datetime.utcnow() - timedelta(minutes=15))
@@ -1670,6 +1790,8 @@ def _register_trade_from_trade_obj(session, trade: Trade) -> IbTrade:
         if t.original_entry_price:
             t.original_entry_price = -abs(t.original_entry_price)
 
+    t.status = TradeStatus.PRE_OPEN_CHECK
+
     session.add(t)
     session.commit()
 
@@ -1847,9 +1969,8 @@ class IbDbApp(IbApp):
 def run_ib_database(ib_app, Session):
     """Executes trade management ibdb functions on an interval."""
     session = Session()
-
     Base.metadata.create_all(bind=session.bind)
-    session.commit()
+
     if CANCEL_PLACED_ORDERS_ON_START:
         ib_app.reqGlobalCancel()
 
@@ -1864,6 +1985,7 @@ def run_ib_database(ib_app, Session):
             (sync_gsheet_trades, (session,)),
             (request_ib_contract_ids, (session, ib_app)),
             (sync_price_subscriptions, (session, ib_app)),
+            (sync_pre_check_trades, (session, ib_app)),
             (sync_opening_orders, (session,)),
             (evaluate_trades, (session,)),
             (place_orders, (session, ib_app)),
@@ -1883,9 +2005,8 @@ def run_ib_database(ib_app, Session):
             except Exception as e:
                 log.error("error executing core function {}: {}".format(func.__name__, e))
                 session.rollback()
-
-        session.commit()
         session.close()
+
         sleep(EVAL_INTERVAL)
 
 

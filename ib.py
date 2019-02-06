@@ -36,7 +36,7 @@ tick_type_map = {
     TickTypeEnum.CLOSE: 'close'
 }
 STOP_LOSS = 'Stop loss'
-TGT_REACHED = 'Target reached'
+TGT_REACHED = 'Profit target'
 CODES_IB_INTERNAL = [
     # server errors
     320,
@@ -56,6 +56,7 @@ CODES_PROGRAMMING_ERROR = [
     315,    # comboLeg routing issue - exchange needs to be SMART
     325,    # exchange/order error
     99991,  # Internal Order Timeout
+
 ]
 
 CODES_USER_ERROR = [
@@ -68,6 +69,8 @@ CODES_USER_ERROR = [
     312,  # Invalid comboLeg details
     313,  # one comboLeg is invalid
     392,  # already expired contract
+    99992,  # Internal price request timeout (maybe in tandem with 200 error?)
+    99993 # <> 5% difference from entry price to market price.
 ]
 
 def now_is_rth():

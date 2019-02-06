@@ -24,6 +24,7 @@ elif not os.path.exists("C:/Users/zbarge") and DEV_MODE:
 
 print("DEV_MODE: {}".format(DEV_MODE))
 
+CACHE_10_SEC = cachetools.TTLCache(9999, 10)
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 LOG_DIR = DATA_DIR
 GMAIL_CREDS_PATH = os.path.join(DATA_DIR, "gmail-creds-dev.json" if DEV_MODE else "gmail-creds.json")
@@ -351,18 +352,32 @@ def est_to_utc(x):
     return t.astimezone(pytz.timezone('UTC')).replace(tzinfo=None)
 
 
+def get_hours_to_market_open():
+    return get_seconds_to_market_open()/60/60
+
+
+def get_minutes_to_market_open():
+    return get_seconds_to_market_open()/60
+
+
 def get_seconds_to_market_open():
+    try:
+        return CACHE_10_SEC['seconds_to_market']
+    except KeyError:
+        pass
+
     est = pytz.timezone('US/Eastern')
     now = datetime.now(est)
     nyse = mcal.get_calendar('NYSE')
     mkt_open = nyse.schedule(now, now + timedelta(days=5))
     next_open = mkt_open.iloc[0]['market_open'].astimezone(est)
-    return (next_open - now).total_seconds()
+    CACHE_10_SEC['seconds_to_market'] = res = (next_open - now).total_seconds()
+
+    return res
 
 
 def now_is_rth():
-    seconds = get_seconds_to_market_open()
-    return seconds < 0
+    return get_seconds_to_market_open() < 0
 
 
 def is_localtime_old(local_time, old_seconds=60):

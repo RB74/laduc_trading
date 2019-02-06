@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 config = utils.config
 
 STOP_LOSS = 'Stop loss'
-TGT_REACHED = 'Target reached'
+TGT_REACHED = 'Profit target'
 
 SHEET_TEST_MODE = config['ib'].getboolean('sheet_test_mode', True)
 SHEET_TIME_FMT = '%m/%d/%Y %H:%M'
@@ -213,7 +213,8 @@ def log_trade_error(symbol, message, u_id, date=None, error_code=None):
         date = date.strftime('%Y-%m-%d %H:%M')
 
     sheet = get_data_entry_sheet('IBMessages')
-    sheet.append_row([symbol, u_id, date, message, error_code])
+    values = [symbol, u_id, date, message, error_code]
+    sheet.insert_row(values, index=2)
 
 
 class TradeSheet:

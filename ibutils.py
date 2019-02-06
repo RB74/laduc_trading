@@ -10,6 +10,7 @@ from ibapi.contract import Contract as IBContract, ComboLeg
 log = logging.getLogger(__name__)
 LOCAL_TZ = get_localzone()
 
+
 def clean_ib_package():
     import pkgutil
 
