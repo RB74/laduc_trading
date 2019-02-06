@@ -2023,10 +2023,13 @@ def run_ibdb_app():
     thread = IbAppThreaded(cls=IbDbApp)
     thread.start()
     sleep(5)
-    run_ib_database(thread.app, Session)
 
-    thread.app.disconnect()
-    thread.join()
+    try:
+        run_ib_database(thread.app, Session)
+    finally:
+        thread.app.disconnect()
+        thread.join()
+
 
 
 
