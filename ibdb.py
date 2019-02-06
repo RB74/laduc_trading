@@ -86,6 +86,20 @@ class IbMktDataSubscription(Base):
     def cancel_subscription(self, ib_app):
         if self.request_id:
             ib_app.cancelMktData(self.request_id)
+            self.request_id = None
+            self.date_requested = None
+            self.active = 0
+
+    @hybrid_method
+    def request_subscription(self, ib_app, contract: ibutils.Contract):
+        self.active = 1
+        self.request_id = ib_app.register_contract(contract)
+        self.date_requested = datetime.utcnow()
+
+    @hybrid_method
+    def refresh_subscription(self, ib_app, contract):
+        self.cancel_subscription(ib_app)
+        self.request_subscription(ib_app, contract)
 
 
 class IbTrade(Base):
@@ -115,6 +129,7 @@ class IbTrade(Base):
     entry_price = Column(Float)
     pct_sold = Column(Integer)
     exit_price = Column(Float)
+    underlying_exit_price = Column(Float)
     date_entered = Column(DateTime)
     date_exited = Column(DateTime)
     date_updated = Column(DateTime, default=datetime.utcnow)
@@ -636,8 +651,8 @@ def call_with_session(func, *args):
     return result
 
 
-def delete_old_prices(session):
-    condition = IbPrice.time < datetime.utcnow() - timedelta(minutes=20)
+def delete_old_prices(session, minutes=20):
+    condition = IbPrice.time < datetime.utcnow() - timedelta(minutes=minutes)
     session.query(IbPrice).filter(condition).delete(synchronize_session=False)
 
 
@@ -734,6 +749,7 @@ def evaluate_trades(session, outside_rth=False):
         if action and qty:
             if abs(qty) > abs(left):
                 qty = left
+            t.underlying_exit_price = price
             register_order(session, t, action, qty, status=OrderStatus.READY)
 
 
@@ -916,12 +932,11 @@ def register_market_data_subscription(session, api_contract, ib_app):
 
     price = get_price_by_contract_id(session, contract_id, min_seconds=60*5)
     if not price:
-        if not sub.date_requested or sub.date_requested < datetime.utcnow() - timedelta(minutes=3):
-            sub.request_id = ib_app.register_contract(api_contract)
-            sub.date_requested = datetime.utcnow()
+        if not sub.date_requested or sub.date_requested > datetime.utcnow() - timedelta(minutes=3):
+            sub.request_subscription(ib_app, api_contract)
 
         session.commit()
-        timeout = datetime.now() + timedelta(seconds=30)
+        timeout = datetime.now() + timedelta(seconds=60)
         while datetime.now() < timeout:
             price = get_price_by_contract_id(session, contract_id, min_seconds=60*5)
             if price:
@@ -1079,11 +1094,12 @@ def register_ib_price(session, contract, price_data):
     p.bid = price_data['bid']
     p.ask = price_data['ask']
     p.price = price_data['mid']
-    p.time = price_data['bid_time']
+    p.time = price_data['mid_time']
     try:
         session.add(p)
         session.commit()
-    except (OperationalError, IntegrityError):
+    except (OperationalError, IntegrityError) as e:
+        log.error(e)
         session.rollback()
 
 
@@ -1160,6 +1176,7 @@ def register_position(session, account_name, contract, position):
     except StaleDataError:
         session.rollback()
         return
+
 
 def register_trade(session, trade):
     if hasattr(trade, '__iter__'):
@@ -1413,16 +1430,14 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
             session.add(sub)
             subscriptions_map[sub.contract_id] = sub
 
-        sub.cancel_subscription(ib_app)
-        sub.active = 1
-        sub.request_id = ib_app.register_contract(c)
-        sub.date_requested = datetime.utcnow()
+        sub.refresh_subscription(ib_app, c)
         current_contract_ids.append(c.key)
 
     # Drop inactive subscriptions
     active_trades = session.query(IbTrade).filter(
         and_(IbTrade.date_exited.is_(None),
              IbTrade.registration_attempts <= 3,
+             IbTrade.status == TradeStatus.OPEN
              )
     ).all()
 
@@ -1436,7 +1451,6 @@ def sync_price_subscriptions(session, ib_app, outside_rth=False):
 
     for sub in qry.all():
         sub.cancel_subscription(ib_app)
-        sub.active = 0
 
     session.commit()
 
@@ -1529,11 +1543,13 @@ def sync_fills(session):
 
             # Assumes all BAG trades are "LONG" to IB. Even when the sub-contracts make the position
             # A technical short trade. (e.g credit trades)
-            if db_trade.sec_type == 'BAG' and db_trade.size < 0:
-                if order.action == 'BUY':
-                    attrs['entry_price'] = -abs(attrs['entry_price'])
+            if db_trade.sec_type == 'BAG':
+                key = 'entry_price' if order.action == 'BUY' else 'exit_price'
+                if db_trade.size < 0:
+                    attrs[key] = -abs(attrs[key])
                 else:
-                    attrs['exit_price'] = -abs(attrs['exit_price'])
+                    attrs[key] = abs(attrs[key])
+
         else:
             if order.action == 'SELL':
                 attrs['date_entered'] = now_est
@@ -1717,7 +1733,6 @@ def _get_price_data_import(contract: ibutils.Contract, data: dict):
     throttle_key = 'handle_price' + contract.key
     if MAP_10_SEC.get(throttle_key, None):
         return
-    MAP_10_SEC[throttle_key] = True
 
     bid = data.get('bid', None)
     bid_time = data.get('bid_time', None)
@@ -1731,12 +1746,14 @@ def _get_price_data_import(contract: ibutils.Contract, data: dict):
     if bid_time < check_time or ask_time < check_time:
         return
 
+    MAP_10_SEC[throttle_key] = True
+
     mid = (bid+ask)/2
     if contract.secType in ('STK', 'OPT', 'BAG'):
         mid = round(mid, 2)
 
     data['mid'] = mid
-    data['mid_time'] = check_time
+    data['mid_time'] = min(bid_time, ask_time)
 
     return data
 
@@ -1970,6 +1987,12 @@ def run_ib_database(ib_app, Session):
     """Executes trade management ibdb functions on an interval."""
     session = Session()
     Base.metadata.create_all(bind=session.bind)
+    delete_old_prices(session, minutes=1)
+    for sub in session.query(IbMktDataSubscription).all():
+        sub.request_id = None
+        sub.date_requested = None
+    session.commit()
+    session.close()
 
     if CANCEL_PLACED_ORDERS_ON_START:
         ib_app.reqGlobalCancel()
