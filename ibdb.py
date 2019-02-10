@@ -183,7 +183,6 @@ class IbTrade(Base):
         valid_legs = [leg.ib_contract_id for leg in legs if leg.ib_contract_id]
         return len(valid_legs) == len(legs)
 
-    # TODO: Verify all BAG trades are long.
     @hybrid_property
     def is_short(self):
         if self.sec_type == 'BAG':
@@ -197,6 +196,14 @@ class IbTrade(Base):
         return self.size > 0
 
     @hybrid_property
+    def left_qty(self):
+        # Amount of shares left to close the trade.
+        if self.is_short:
+            return self.total_qty - self.bought_qty
+        else:
+            return self.total_qty - self.sold_qty
+
+    @hybrid_property
     def total_qty(self):
         """
         Returns the total open quantity.
@@ -205,12 +212,9 @@ class IbTrade(Base):
         Falls back to the IbTrade.entry_price (if no original)
         Returns 0 if default and fallbacks don't exist.
         """
-        orders = self.orders
+        orders = self.get_orders_by_action('BUY' if self.is_long else 'SELL')
         if orders:
-            side = 'BUY' if self.is_long else 'SELL'
-            open_orders = [o for o in orders if o.action == side]
-            if open_orders:
-                return sum([o.qty for o in open_orders])
+            return sum([o.qty for o in orders])
 
         size = self.size
         entry = self.original_entry_price or self.entry_price
@@ -224,25 +228,33 @@ class IbTrade(Base):
 
     @hybrid_property
     def stop_qty(self):
-        return round(self.total_qty/len(self.stop_prices), 0)
+        # Number of shares to stop out with.
+        targets, stops = self.get_target_and_stop_orders()
+        expected_execs = len(self.stop_prices)
+
+        if targets or len(stops) == expected_execs - 1:
+            return self.left_qty
+        return round(self.total_qty/expected_execs, 0)
 
     @hybrid_property
     def target_qty(self):
-        return round(self.total_qty/len(self.target_prices), 0)
+        # Number of shares to close
+        targets, stops = self.get_target_and_stop_orders()
+        expected_execs = len(self.target_prices)
+
+        if stops or len(targets) == expected_execs - 1:
+            return self.left_qty
+        return round(self.total_qty/expected_execs, 0)
 
     @hybrid_property
-    def bought_qty(self):
-        return sum([order.qty for order in self.orders
-                    if order.action == 'BUY'
-                    and order.status == OrderStatus.COMPLETE
-                    and order.exclude == 0])
+    def bought_qty(self) -> float:
+        # Number of shares bought
+        return sum([abs(order.qty) for order in self.get_orders_completed_by_action('BUY')])
 
     @hybrid_property
-    def sold_qty(self):
-        return sum([abs(order.qty) for order in self.orders
-                    if order.action == 'SELL'
-                    and order.status == OrderStatus.COMPLETE
-                    and order.exclude == 0])
+    def sold_qty(self) -> float:
+        # Number of shares sold
+        return sum([abs(order.qty) for order in self.get_orders_completed_by_action('SELL')])
 
     @hybrid_property
     def target_prices(self) -> list:
@@ -275,12 +287,74 @@ class IbTrade(Base):
         return contract.get_ib_contract(self.id)
 
     @hybrid_method
+    def get_orders_by_action(self, action):
+        return [order for order in self.orders
+                if order.action == action
+                and order.status != OrderStatus.ERROR
+                and order.exclude == 0]
+
+    @hybrid_method
+    def get_orders_completed_by_action(self, action):
+        return [order for order in self.orders
+                if order.action == action
+                and order.status == OrderStatus.COMPLETE
+                and order.exclude == 0]
+
+    @hybrid_method
+    def get_target_and_stop_orders(self) -> (list, list):
+        """
+        Returns a list of target order/executions and a list of stop order/executions.
+        Each object within each list is a tuple like
+            (IbOrder, IbExecution)
+        OR (for BAG trades)
+            (IbOrder, list(IbExecution1, IbExecution2,..))
+        :return:
+        """
+        action = 'BUY' if self.is_short else 'SELL'
+        orders = self.get_orders_completed_by_action(action)
+        orders_desc = sorted(orders, key=lambda o: o.request_id, reverse=True)
+        targets, stops = list(), list()
+
+        for order in orders_desc:
+            e = order.get_last_execution()
+
+            if e is None:
+                continue
+
+            if self.sec_type == 'BAG':
+                e = order.get_valid_executions()
+                exit = order.get_executed_price(e)
+            else:
+                exit = e.avg_price
+
+            if self.is_short:
+                if abs(exit) < self.entry_price:
+                    targets.append((order, e))
+
+                else:
+                    stops.append((order, e))
+
+            elif self.is_long:
+                if self.sec_type == 'BAG':
+                    if self.size < 0:
+                        diff = exit - -self.entry_price
+                        if diff > 0:
+                            targets.append((order, e))
+                        else:
+                            stops.append((order, e))
+                        continue
+
+                if abs(exit) >= self.entry_price:
+                    targets.append((order, e))
+                else:
+                    stops.append((order, e))
+
+        return targets, stops
+
+    @hybrid_method
     def get_next_target(self):
         action = 'BUY' if self.is_short else 'SELL'
-        orders = [order for order in self.orders
-                  if order.action == action
-                  and order.status != OrderStatus.ERROR
-                  and order.exclude == 0]
+        orders = self.get_orders_by_action(action)
         idx = len(orders)
 
         try:
@@ -291,10 +365,7 @@ class IbTrade(Base):
     @hybrid_method
     def get_next_stop(self):
         action = 'BUY' if self.is_short else 'SELL'
-        orders = [order for order in self.orders
-                  if order.action == action
-                  and order.status != OrderStatus.ERROR
-                  and order.exclude == 0]
+        orders = self.get_orders_by_action(action)
         idx = len(orders)
         try:
             return idx, self.stop_prices[idx]
@@ -505,6 +576,13 @@ class IbOrder(Base):
             o.smartComboRoutingParams = []
             o.smartComboRoutingParams.append(TagValue("NonGuaranteed", "1"))
         return o
+
+    @hybrid_method
+    def get_last_execution(self):
+        session = Session.object_session(self)
+        return session.query(IbExecution).filter(
+            IbExecution.order_id == self.request_id
+        ).order_by(IbExecution.utc_time.desc()).first()
 
     @hybrid_method
     def get_valid_executions(self) -> list:
@@ -1376,7 +1454,7 @@ def sync_pre_check_trades(session, ib_app):
 
         diff = abs(abs(og_entry) - abs(price))
 
-        if diff > 0.05*price:
+        if abs(diff) > 0.05*abs(price):
             msg = IbTradeMessage()
             msg.error_code = 99993
             msg.text = "original entry price ({}) " \

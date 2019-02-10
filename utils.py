@@ -152,6 +152,12 @@ def ensure_price(x):
         return None
 
 
+def get_cumulative_price(string):
+    prices = map(ensure_price, str(string).split(','))
+    non_null = [p for p in prices if p]
+    return sum(non_null)
+
+
 def get_prices_list(x, count=3, default=None):
     prices = [ensure_price(y) or default for y in str(x).split(',')]
     if len(prices) < count:
@@ -377,7 +383,11 @@ def get_seconds_to_market_open():
 
 
 def now_is_rth():
-    return get_seconds_to_market_open() < 0
+    return _time_is_rth(get_seconds_to_market_open())
+
+
+def _time_is_rth(seconds):
+    return 0 > seconds > -6.5 * 60 * 60
 
 
 def is_localtime_old(local_time, old_seconds=60):

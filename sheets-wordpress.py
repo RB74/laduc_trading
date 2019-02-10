@@ -5,7 +5,7 @@ import gspread
 import requests
 import configparser
 import multiprocessing
-from utils import try_float
+from utils import try_float, get_cumulative_price
 from datetime import datetime
 from Laduc_SQL import SQLClient
 from Laduc_WordPress import WordPressClientInit as WPInit
@@ -25,10 +25,9 @@ wp_category_map = {
 start_time = datetime.now()
 
 
-
-def _get_wp_category(entry_type):
+def _get_wp_category(entry_type) -> int:
     """
-    Helper function retrieves the appropriate wordpress category ID
+    Retrieves the appropriate wordpress category ID
     for creating new posts. This allows different post categories
     based on alert type.
     :param entry_type:
@@ -39,6 +38,43 @@ def _get_wp_category(entry_type):
     t_parts = str(entry_type).split('-')
     t = (t_parts[-1] if len(t_parts) > 1 else entry_type).lower()
     return wp_category_map.get(t, 289)
+
+
+def _get_stop_change(g_row, sql_rows) -> bool:
+    """
+    2/9/2019: Trigger a Trade Alert when the stop_loss price(s) have changed.
+
+    Gets the sum of stop_loss on GSheet and SQL rows.
+
+    If stop_loss has changed
+      - the post title is updated to include "STOPCHANGED"
+      - the post is allowed to trigger (even if it's already triggered).
+
+    :returns:
+        False when the trade u_id doesn't exist in the DB or stop_loss has NO CHANGE.
+        'STOPCHANGED' when the stop_loss has changed.
+    """
+    try:
+        sql_row = sql_rows[g_row['u_id']]
+    except KeyError:
+        return False
+
+    if g_row['fields']['date_exited'].strip():
+        return False
+
+    g_stop = get_cumulative_price(g_row['fields']['stop_loss'])
+    sql_stop = get_cumulative_price(sql_row['stop_loss'])
+
+    if g_stop == sql_stop:
+        return False
+
+    # Ensure trigger value is in the WP Post title.
+    v = 'STOPCHANGED'
+    if v not in g_row['post']['title']:
+        g_row['post']['title'] = g_row['post']['title'].replace(
+            'Trade Alert - #', 'Trade Alert - ({}) #'.format(v))
+
+    return True
 
 
 def main():
@@ -74,7 +110,7 @@ def main():
         finally:
             sys.exit(0)
 
-    valid_ids = get_uids_valid_for_post(g_data)
+    valid_ids = get_uids_valid_for_post(SQL, g_data)
 
     if not valid_ids:
         print('No valid u_ids')
@@ -92,9 +128,9 @@ def main():
     wp = WordPressClient(WPInit())
 
     for obj in g_data:
-        # Checking for 'obj['u_id']' in valid id list
         if obj['u_id'] not in valid_ids:
             continue
+
         # Checking for global variables 'sheet_test_mode','test_mode' and 'test_wordpress'
         # If test_mode is True, don't do anything and just return True
         if sheet_test_mode or (test_mode and not test_wordpress):
@@ -155,16 +191,17 @@ def main():
     print()
 
 
-def get_uids_valid_for_post(g_data, compare_prices=False):
+def get_uids_valid_for_post(db_client, g_data, compare_prices=False):
     """
     Comparing the Google Spreadsheet data against database data to find out valid data to create posts
-
+    :param db_client: (Laduc_SQL.SQLClient)
     :param g_data: (list(dict)) A list of rows from Google Spreadsheet
     :param compare_prices: (boolean, default False)
-        False will return only new u_ids that aren't in the database.
+        False will return new u_ids that aren't in the database
+            AND u_ids where the target/stop price has changed.
 
-        True will include u_ids if the entry or exit
-        price is different from what is in the database.
+        True will include the above AND u_ids if the entry or exit
+        price has changed.
 
     returns: (list)
         Of u_ids that need a new Wordpress Post.
@@ -178,24 +215,27 @@ def get_uids_valid_for_post(g_data, compare_prices=False):
         sql_check = {
             row['u_id']: {
                 'entry_price': row['entry_price'],
-                'exit_price': row['exit_price']
+                'exit_price': row['exit_price'],
+                'stop_loss': row['stop_loss'],
+                'profit_exit': row['profit_exit']
             }
-            for row in SQL.get_trade_entries(u_ids, finished)
+            for row in db_client.get_trade_entries(u_ids, finished)
         }
 
         # Completed Trades
         finished = True
-        sql_finished = {obj['u_id'] for obj in SQL.get_trade_entries(u_ids, finished)}
+        sql_finished = {obj['u_id'] for obj in db_client.get_trade_entries(u_ids, finished)}
     except Exception as e:
         print('Check - SQL_data issue -', repr(e))
         return list()
 
-    # Maybe return only new u_ids w/ a date_entered value.
+    # Maybe return only new u_ids (and stop/target changed u_ids) w/ a date_entered value.
     if not compare_prices:
         return [
             g_row['u_id'] for g_row in g_data
             if g_row['u_id'] not in sql_finished
-            and g_row['u_id'] not in sql_check
+            and (g_row['u_id'] not in sql_check
+                 or _get_stop_change(g_row, sql_check))
             and g_row['fields']['date_entered'].strip()
         ]
 
@@ -219,6 +259,8 @@ def get_uids_valid_for_post(g_data, compare_prices=False):
 
             if row_entry != sql_entry or row_exit != sql_exit:
                 # Updated trade entry
+                valids.add(id)
+            elif _get_stop_change(g_row, sql_check):
                 valids.add(id)
         else:
             # New trade entry
