@@ -536,7 +536,6 @@ class IbExecution(Base):
     contract_id = Column(String)
 
 
-
 class IbOrder(Base):
     """ibapi Orders"""
     __tablename__ = 'ib_orders'
@@ -615,19 +614,19 @@ class IbOrder(Base):
         trade = self.trade
         if trade and trade.sec_type == 'BAG':
             return self.get_executed_bag_qty(execs, trade)
-        return sum([e.shares for e in execs])
+        latest_exec = list(sorted(execs, key=lambda x: x.cum_qty))[-1]
+        return latest_exec.cum_qty
 
     @hybrid_method
     def get_executed_bag_qty(self, execs, trade):
-        """Calculates shares traded of each leg and return IbOrder.qty or 0"""
+        """Return IbOrder.qty or 0"""
         for leg in trade.legs:
             sub_execs = [b for b in execs
-                         if b.contract_id == leg.contract_id]
-            exec_qty = sum([b.shares for b in sub_execs])
-            leg_qty = exec_qty / leg.ratio
-            if leg_qty < self.qty:
-                # All or nothing game
+                         if b.contract_id == leg.contract_id
+                         and b.cum_qty/leg.ratio == self.qty]
+            if not sub_execs:
                 return 0
+
         return self.qty
 
     @hybrid_method
@@ -637,11 +636,8 @@ class IbOrder(Base):
         if trade and trade.sec_type == 'BAG':
             return self.get_executed_bag_price(execs, trade)
 
-        total_cost = sum([e.price*e.shares for e in execs])
-        total_shares = sum([e.shares for e in execs])
-
-        price = total_cost/total_shares
-        return price
+        latest_exec = list(sorted(execs, key=lambda x: x.cum_qty))[-1]
+        return latest_exec.avg_price
 
     @hybrid_method
     def get_executed_bag_price(self, execs, trade):
@@ -650,18 +646,19 @@ class IbOrder(Base):
 
         for leg in trade.legs:
             sub_execs = [b for b in execs
-                         if b.contract_id == leg.contract_id]
+                         if b.contract_id == leg.contract_id
+                         and b.cum_qty/leg.ratio == self.qty]
             if not sub_execs:
-                continue
+                return 0
 
-            sub_total_cost = sum([b.price*b.shares for b in sub_execs])
-            sub_total_qty = sum([b.shares for b in sub_execs])
-            sub_avg_price = sub_total_cost/sub_total_qty
-            sub_avg_price *= leg.ratio
+            latest_exec = list(sorted(sub_execs, key=lambda x: x.utc_time))[-1]
+            sub_avg_price = latest_exec.avg_price*leg.ratio
 
             if sub_execs[0].side == 'SLD':
                 sub_avg_price = -sub_avg_price
+
             price += sub_avg_price
+
         return price
 
     def __repr__(self):
@@ -772,8 +769,6 @@ def evaluate_trades(session, outside_rth=False):
         p = get_price_by_contract_id(session, t.underlying_contract_id, min_seconds=60*3)
         if p is None:
             continue
-        if t.registration_attempts > 0:
-            t.registration_attempts = 0
         price = p.price
 
         target_idx, target_price = t.get_next_target()
@@ -1552,6 +1547,7 @@ def sync_timed_out_orders(session):
         if trade is None:
             continue
 
+        trade.status = TradeStatus.ERROR
         msg = IbTradeMessage()
         msg.error_code = 99991
         msg.text = "Execution order time out. Delete/recreate the trade."
