@@ -60,13 +60,14 @@ class WordPressClientInit:
             #WordPress URL for authentication
             url = 'https://laductrading.com/wp-json/simple-jwt-authentication/v1/token'
             r = requests.post(url, data=params)
+            e = ''
             if r and r.status_code in [200]:
                 try:
                     #Fetching Token if authentication is successful
                     token = r.json()['token']
                     return token
                 except Exception as e:
-                    print('WP - _check_token - config set -',repr(e))
+                    print('WP - _check_token - config set -', repr(e))
             else:
                 print('WP - _check_token - request error -', repr(e), r, r.reason, r.content)
 

@@ -56,7 +56,8 @@ CODES_PROGRAMMING_ERROR = [
     315,    # comboLeg routing issue - exchange needs to be SMART
     325,    # exchange/order error
     99991,  # Internal Order Timeout
-
+    99994,  # Position sizing error detected.
+    399     # Order placed after hours and shouldn't have been.
 ]
 
 CODES_USER_ERROR = [

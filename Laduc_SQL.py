@@ -53,7 +53,11 @@ class SQLClient:
         Function closing connection with MySQL DB
         """
         # print('RDSClient: Connection closed.')
-        self.connection.close()
+        try:
+            self.connection.close()
+            return True
+        except Exception:
+            return False
 
     def ping(self):
         """
@@ -115,6 +119,23 @@ class SQLClient:
             self.connection.rollback()
             time.sleep(5)
             return False
+
+    def get_wp_post_max_date(self) -> str:
+        date_string = ''
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            cursor.execute("select max(wp_date) as wp_date from wp_ac_posts;")
+            result = cursor.fetchone()
+
+            date_string = result['wp_date']
+
+            cursor.close()
+        except Exception as e:
+            print('SQL get_wp_post_max_date - error', e)
+            self.connection.rollback()
+
+        return date_string
 
     def wp_push_ac_posts(self, data):
         """
@@ -396,7 +417,6 @@ class SQLClient:
             self.connection.rollback()
             time.sleep(5)
             return False
-
 
     def get_trade_entries(self, u_ids, finished):
         """

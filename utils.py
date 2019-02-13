@@ -25,6 +25,7 @@ elif not os.path.exists("C:/Users/zbarge") and DEV_MODE:
 print("DEV_MODE: {}".format(DEV_MODE))
 
 CACHE_10_SEC = cachetools.TTLCache(9999, 10)
+CACHE_1_HR = cachetools.TTLCache(500, 60*60)
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 LOG_DIR = DATA_DIR
 GMAIL_CREDS_PATH = os.path.join(DATA_DIR, "gmail-creds-dev.json" if DEV_MODE else "gmail-creds.json")
@@ -380,6 +381,41 @@ def get_seconds_to_market_open():
     CACHE_10_SEC['seconds_to_market'] = res = (next_open - now).total_seconds()
 
     return res
+
+
+def get_nyse_open_close():
+    try:
+        open = CACHE_1_HR['nyse_open']
+        close = CACHE_1_HR['nyse_close']
+        return open, close
+    except KeyError:
+        pass
+    est = pytz.timezone('US/Eastern')
+    now = datetime.now(est)
+    nyse = mcal.get_calendar('NYSE').schedule(now, now + timedelta(days=2))
+    today = nyse.iloc[0]
+    open = today['market_open']
+    close = today['market_close']
+    CACHE_1_HR['nyse_open'] = open
+    CACHE_1_HR['nyse_close'] = close
+    return open, close
+
+
+def get_market_options_open(utc_time=None):
+    if utc_time is None:
+        utc_time = datetime.utcnow()
+    open, close = get_nyse_open_close()
+    return open <= utc_time < close
+
+
+def get_market_stocks_open(utc_time=None, after_hours_minutes=30):
+    if utc_time is None:
+        utc_time = now_est()
+    open, close = get_nyse_open_close()
+    close = close + timedelta(minutes=after_hours_minutes)
+    return open <= utc_time < close
+
+
 
 
 def now_is_rth():

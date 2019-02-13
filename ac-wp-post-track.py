@@ -15,23 +15,27 @@ def main():
     
     Return values: None
     """
-    # Fetching current time
+
     start_time = datetime.now()
-    print(start_time)
-    # WP is used for initialization of WordPressClient
     WP = WordPressClient(WPInit())
-    # After is generating time difference of 2 minutes in 'US/Eastern' timezone from where we wanted to track post
-    after = (datetime.now(pytz.UTC)-timedelta(minutes=2)).astimezone(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d %H:%M:%S')
+
+    try:
+        SQL = RSQL()
+    except Exception as e:
+        print('SQL Init Error -', repr(e))
+        return
+
     # Retrieving all posts for specified period from WordPress
+    after = SQL.get_wp_post_max_date()
+    if not after:
+        # After is generating time difference of 2 minutes in 'US/Eastern' timezone from where we wanted to track post
+        after = (datetime.now(pytz.UTC) - timedelta(minutes=2))\
+            .astimezone(pytz.timezone('US/Eastern'))\
+            .strftime('%Y-%m-%d %H:%M:%S')
+    print("{}: ac-wp-track.py: Looking for posts after '{}'".format(start_time, after))
     posts = WP.posts_list(after)
 
     if posts:
-        try:
-            # Creating connection with database using SQLClient 
-            SQL = RSQL()
-        except Exception as e:
-            print('SQL Init Error -', repr(e))
-
         try:
             # cat_ids is object which is fetching all distinct category id's from 'wp_ac_map' Sql table
             cat_ids = SQL.wp_get_cat_ids_valid()
@@ -65,7 +69,6 @@ def main():
             print('Post parse error -', repr(e))
 
         try:
-            #if rows list is not empty
             if rows:
                 try:
                     # It is pushing rows data into wp_ac_posts Sql table 
@@ -74,11 +77,6 @@ def main():
                 except Exception as e:
                     print('SQL - wp_push posts -', repr(e))
 
-            try:
-                SQL.close()
-            except:
-                pass
-
         except Exception as e:
             print('SQL push Error -', repr(e))
 
@@ -86,8 +84,9 @@ def main():
             # It is printing all post
             print(post['date'], post['slug'], post['link'])
 
+    SQL.close()
     end_time = datetime.now()
-    print('Script finished in', end_time - start_time)
+    print('ac-wp-post-track.main() finished in', end_time - start_time)
     print('--------')
 
 

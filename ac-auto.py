@@ -79,7 +79,7 @@ def main():
     set_globals()
     # Setting the current time
     start_time = datetime.now()
-    print(start_time)
+    print("{}: ac-auto.main()".format(start_time))
 
     #Setting the TEST_MODE as global variable to specify if this is Test (True) or Production (False)
     global TEST_MODE
@@ -175,7 +175,7 @@ def main():
         print(len(posts_valid), 'valid posts')
 
     end_time = datetime.now()
-    print('Script finished in', end_time - start_time)
+    print('ac-auto.main() script finished in', end_time - start_time)
     print('--------')
 
 

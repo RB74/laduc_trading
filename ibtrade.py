@@ -1,4 +1,5 @@
 import os
+import re
 from ssl import SSLEOFError
 import utils
 import logging
@@ -80,7 +81,6 @@ def get_data_entry_rows():
 def get_data_entry_trades(trade_sheet=None, rows=None):
     if not rows:
         rows = get_data_entry_rows()
-    #log.debug("ibtrade.get_data_entry_trades")
     return [
         Trade.from_gsheet_row(row, trade_sheet, row_idx=idx)
         for idx, row in enumerate(rows, start=2)
@@ -96,7 +96,6 @@ def get_data_entry_trades(trade_sheet=None, rows=None):
 def get_data_entry_trades_closed(trade_sheet=None, rows=None, from_utc=None):
     if not rows:
         rows = get_data_entry_rows()
-    #log.debug("ibtrade.get_data_entry_trades_closed")
     if not from_utc:
         from_utc = datetime.utcnow() - timedelta(days=3)
 
@@ -118,24 +117,53 @@ def get_data_entry_trades_closed(trade_sheet=None, rows=None, from_utc=None):
 
 def get_sheet_row_by_uid(u_id):
     sheet = get_data_entry_sheet()
+    key = re.compile(r'{}\b'.format(u_id))
+
     try:
-        return sheet.findall(u_id)[0].row
+        return sheet.findall(key)[0].row
     except IndexError:
         pass
 
 
 def get_sheet_test_mode() -> bool:
     """Returns whether or not the sheet is in 'test mode' (No trade evaluations allowed)."""
-    value = get_data_entry_sheet().row_values(1)[-1]
+    try:
+        value = get_data_entry_sheet().row_values(1)[-1]
+    except Exception as e:
+        log.error("Fatal error in ibtrade.get_sheet_test_mode: Defaulting to TEST_MODE = True: {}".format(e))
+        return True
+
     if value not in ('TRUE', 'FALSE'):
         log.error("ibtrade.get_sheet_test_mode:: expected TRUE/FALSE but instead got '{}'".format(value))
         return True
     return value != 'FALSE'
 
 
+def get_target_and_stop_errors(entry_price, target_prices, stop_prices):
+    targets_above = False
+    stops_below = False
+    for t in target_prices:
+        if t > entry_price:
+            targets_above = True
+        elif targets_above:
+            return "Inconsistent target_prices."
+    for s in stop_prices:
+        if s < entry_price:
+            stops_below = True
+        elif stops_below:
+            return "Inconsistent stop prices"
+
+    if targets_above and not stops_below:
+        if not stops_below:
+            return "Targets and stops can't both be above the entry price."
+
+
 def close_sheet_trade(u_id, close_pct, price, timestamp, notes):
     sheet = get_data_entry_sheet()
-    row = sheet.findall(u_id)[0].row
+    row = get_sheet_row_by_uid(u_id)
+    if row is None:
+        return False
+
     new_uid = utils.get_uid()
 
     sheet.update_cell(row, 10, '{}%'.format(close_pct))  # % Sold
@@ -149,7 +177,9 @@ def close_sheet_trade(u_id, close_pct, price, timestamp, notes):
 
 def close_sheet_trade_partial(u_id, close_pct, price, timestamp, notes):
     sheet = get_data_entry_sheet()
-    og_row = sheet.findall(u_id)[0].row
+    og_row = get_sheet_row_by_uid(u_id)
+    if og_row is None:
+        return False
     n_row = og_row + 1
 
     values = sheet.row_values(og_row, value_render_option='FORMULA')
@@ -192,18 +222,22 @@ def highlight_cell(u_id, col_number, row_idx=None, bg_color='red'):
 
 def open_sheet_trade(u_id, price, timestamp=None):
     sheet = get_data_entry_sheet()
+    row = get_sheet_row_by_uid(u_id)
 
-    try:
-        match = sheet.findall(u_id)[0]
-    except IndexError:
-        return
+    if row is None:
+        return False
 
-    sheet.update_cell(match.row, 9, price)
+    sheet.update_cell(row, 9, price)
     if timestamp:
-        sheet.update_cell(match.row, 12, timestamp)
+        sheet.update_cell(row, 12, timestamp)
+
+    # Release UID to alerts program.
+    sheet.update_cell(row, 22, str(u_id).replace('temp_', ''))
 
     highlight_cell(u_id, 1, bg_color='white')
     highlight_cell(u_id, 9, bg_color='white')
+
+    return True
 
 
 def log_trade_error(symbol, message, u_id, date=None, error_code=None):
@@ -815,7 +849,7 @@ class Trade:
             self._parse_tactic()
             self.valid = True
         except (IndexError, ValueError, KeyError, TypeError) as e:
-            if self.u_id not in self.sheet.invalid_trades:
+            if self.sheet and self.u_id not in self.sheet.invalid_trades:
                 log.debug("Error parsing tactic: {} >> {}".format(self.tactic, e))
                 self.sheet.invalid_trades[self.u_id] = self
         self.__tactic_parsed = True
@@ -853,7 +887,7 @@ class Trade:
         # later even if other rows are added/removed.
 
         sheet.update_cell(self.row_idx, 9, '')
-        sheet.update_cell(self.row_idx, 22, self.u_id)
+        sheet.update_cell(self.row_idx, 22, 'temp_' + str(self.u_id))
 
     def register_entry_price(self, price, overwrite=False):
         assert self.u_id, "Missing u_id on trade {}".format(self)
@@ -1027,6 +1061,8 @@ class Trade:
 
         # Figure out entry price.
         if not self.entry_price:
+            if self.sheet is None:
+                return 1
             entry_price = self.sheet.app.get_midpoint_by_symbol(
                 self.symbol,
                 self.sec_type.lower(),
