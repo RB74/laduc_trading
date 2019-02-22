@@ -23,9 +23,10 @@ elif not os.path.exists("C:/Users/zbarge") and DEV_MODE:
     DEV_MODE = False
 
 print("DEV_MODE: {}".format(DEV_MODE))
-
+UTC = pytz.timezone('UTC')
 CACHE_10_SEC = cachetools.TTLCache(9999, 10)
 CACHE_1_HR = cachetools.TTLCache(500, 60*60)
+CACHE_1_SEC = cachetools.TTLCache(5000, 1)
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 LOG_DIR = DATA_DIR
 GMAIL_CREDS_PATH = os.path.join(DATA_DIR, "gmail-creds-dev.json" if DEV_MODE else "gmail-creds.json")
@@ -263,6 +264,11 @@ def ensure_two_digit_int_str(x: int):
     return x
 
 
+def digits(string):
+    return ''.join(e for e in str(string) if e.isdigit())
+
+
+
 def update_cats():
     """
     Updating all the category slugs for corresponding category ids  
@@ -401,21 +407,31 @@ def get_nyse_open_close():
     return open, close
 
 
-def get_market_options_open(utc_time=None):
+def utcnow_aware():
+    return UTC.localize(datetime.utcnow())
+
+
+def utc_check_aware(utc_time):
     if utc_time is None:
-        utc_time = datetime.utcnow()
+        utc_time = utcnow_aware()
+    elif not hasattr(utc_time, 'tzinfo'):
+        raise TypeError("Expected utc_time to have tzinfo")
+    elif utc_time.tzinfo is None:
+        utc_time = UTC.localize(utc_time)
+    return utc_time
+
+
+def get_market_options_open(utc_time=None):
+    utc_time = utc_check_aware(utc_time)
     open, close = get_nyse_open_close()
     return open <= utc_time < close
 
 
 def get_market_stocks_open(utc_time=None, after_hours_minutes=30):
-    if utc_time is None:
-        utc_time = now_est()
+    utc_time = utc_check_aware(utc_time)
     open, close = get_nyse_open_close()
     close = close + timedelta(minutes=after_hours_minutes)
     return open <= utc_time < close
-
-
 
 
 def now_is_rth():

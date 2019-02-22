@@ -47,6 +47,7 @@ CODES_IB_INTERNAL = [
 ]
 CODES_IGNORE = [
     300,  # invalid request_id for cancelMktData
+    104   # Can't modify a filled order code
 ]
 CODES_PROGRAMMING_ERROR = [
     160,    # 0 quantity order passed
@@ -57,7 +58,8 @@ CODES_PROGRAMMING_ERROR = [
     325,    # exchange/order error
     99991,  # Internal Order Timeout
     99994,  # Position sizing error detected.
-    399     # Order placed after hours and shouldn't have been.
+    399,    # Order placed after hours and shouldn't have been.
+    10052
 ]
 
 CODES_USER_ERROR = [
@@ -71,8 +73,10 @@ CODES_USER_ERROR = [
     313,  # one comboLeg is invalid
     392,  # already expired contract
     99992,  # Internal price request timeout (maybe in tandem with 200 error?)
-    99993 # <> 5% difference from entry price to market price.
+    99993,  # <> 5% difference from entry price to market price.
+    99995,  # Error parsing the tactic
 ]
+
 
 def now_is_rth():
     try:

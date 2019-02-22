@@ -39,6 +39,20 @@ def clean_ib_package():
 clean_ib_package()
 
 
+def get_even_contract_size(capital, contract_price, split=1):
+    qty = round(capital/contract_price, 0)
+    partial_qty = round(qty/split, 0)
+    if partial_qty < 1:
+        partial_qty = 1
+    return partial_qty*split
+
+
+def get_corrected_sheet_size(size, contract_price, split=1, size_factor=1000):
+    even_size = get_even_contract_size(abs(size*size_factor), abs(contract_price), split=split)
+    new_size = round(even_size * contract_price / size_factor, 2)
+    return new_size if size > 0 else -new_size
+
+
 def get_stock_contract(symbol, exchange='SMART'):
     c = Contract()
     c.symbol = symbol

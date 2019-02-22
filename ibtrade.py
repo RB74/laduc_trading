@@ -33,6 +33,9 @@ else:
     settings_filename = 'ib_cfg.json'
     GSHEET_ID = PRODUCTION_SHEET_ID
 
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 
 def get_data_entry_sheet(tab_name='DataEntry'):
     """
@@ -69,8 +72,8 @@ def now_is_rth():
         return o
 
 
-def get_data_entry_rows():
-    log.debug("ibtrade.get_data_entry_rows")
+def get_data_entry_rows() -> list:
+    """Returns a cached (10sec refresh) list of rows from the DataEntry sheet."""
     try:
         return MAP_10_SEC['DE_SHEET_VALUES']
     except KeyError:
@@ -198,7 +201,7 @@ def close_sheet_trade_partial(u_id, close_pct, price, timestamp, notes):
     return Trade.from_gsheet_row([str(v) for v in values])
 
 
-def highlight_cell(u_id, col_number, row_idx=None, bg_color='red'):
+def highlight_cell(u_id=None, col_number=None, row_idx=None, bg_color='red'):
     assert any((row_idx, u_id))
 
     from gspread_formatting import CellFormat, format_cell_range, Color
@@ -218,6 +221,7 @@ def highlight_cell(u_id, col_number, row_idx=None, bg_color='red'):
         row = row_idx
 
     format_cell_range(sheet, rowcol_to_a1(row, col_number), fmt)
+    return True
 
 
 def open_sheet_trade(u_id, price, timestamp=None):
@@ -249,6 +253,14 @@ def log_trade_error(symbol, message, u_id, date=None, error_code=None):
     sheet = get_data_entry_sheet('IBMessages')
     values = [symbol, u_id, date, message, error_code]
     sheet.insert_row(values, index=2)
+
+
+def set_new_trade_size(u_id, size):
+    sheet = get_data_entry_sheet()
+    row = get_sheet_row_by_uid(u_id)
+    if not row:
+        return False
+    sheet.update_cell(row, 3, size)
 
 
 class TradeSheet:
@@ -866,7 +878,7 @@ class Trade:
         sheet = get_data_entry_sheet()
         fmt = CellFormat(backgroundColor=color)
         if self.u_id:
-            row = sheet.findall(self.u_id)[0].row
+            row = get_sheet_row_by_uid(self.u_id)
         else:
             row = self.row_idx
         format_cell_range(sheet, rowcol_to_a1(row, col_number), fmt)
@@ -976,14 +988,11 @@ class Trade:
         except (TypeError, ValueError):
             return  # Unknown.
 
-        if not self.size:
-            self.size = 1
-        elif self.size < 0:
-            return   # We know it's short.
-        elif self.entry_price < 0:
+        if self.entry_price < 0 < self.size and self.sec_type != 'BAG':
+            # Non-BAG trades convert to short
             self.size = -abs(self.size)
             self.entry_price = abs(self.entry_price)
-            return  # Converted to short.
+
         self.__direction_determined = True
 
     def _parse_tactic(self):
