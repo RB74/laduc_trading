@@ -25,6 +25,7 @@ elif not os.path.exists("C:/Users/zbarge") and DEV_MODE:
 print("DEV_MODE: {}".format(DEV_MODE))
 UTC = pytz.timezone('UTC')
 CACHE_10_SEC = cachetools.TTLCache(9999, 10)
+CACHE_5_SEC = cachetools.TTLCache(9999, 5)
 CACHE_1_HR = cachetools.TTLCache(500, 60*60)
 CACHE_1_SEC = cachetools.TTLCache(5000, 1)
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')

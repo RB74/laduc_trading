@@ -15,7 +15,7 @@ from utils import try_float, get_cumulative_price
 from Laduc_WordPress import WordPressClientInit as WPInit
 from oauth2client.service_account import ServiceAccountCredentials
 
-USE_STOP_CHANGE = False
+USE_STOP_CHANGE = True
 # True will re-post trades that have a changed stop.
 
 wp_category_map = {

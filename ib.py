@@ -37,6 +37,9 @@ tick_type_map = {
 }
 STOP_LOSS = 'Stop loss'
 TGT_REACHED = 'Profit target'
+CODE_ORDER_CANT_MODIFY_FILLED = 104   # Can't modify a filled order code
+CODE_ORDER_CANT_CANCEL_FILLED = 10148 # Can't cancel a filled order.
+
 CODES_IB_INTERNAL = [
     # server errors
     320,
@@ -47,7 +50,7 @@ CODES_IB_INTERNAL = [
 ]
 CODES_IGNORE = [
     300,  # invalid request_id for cancelMktData
-    104   # Can't modify a filled order code
+
 ]
 CODES_PROGRAMMING_ERROR = [
     160,    # 0 quantity order passed
@@ -59,7 +62,9 @@ CODES_PROGRAMMING_ERROR = [
     99991,  # Internal Order Timeout
     99994,  # Position sizing error detected.
     399,    # Order placed after hours and shouldn't have been.
-    10052
+    10052,
+    387,    # Unsupported order type for exchange/sec_tpe
+    99996,  # max order errors reached.
 ]
 
 CODES_USER_ERROR = [

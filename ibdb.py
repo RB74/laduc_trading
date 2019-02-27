@@ -9,13 +9,14 @@ import ibutils
 import ibtrade
 from time import sleep
 from threading import Thread
-from utils import CACHE_1_SEC
+from utils import CACHE_1_SEC, CACHE_5_SEC
 from ibapi.order import Order
 from ibapi.contract import ComboLeg
 from ibapi.tag_value import TagValue
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from sqlalchemy.orm.exc import StaleDataError
+from sqlalchemy.pool import SingletonThreadPool
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.exc import IntegrityError, OperationalError
 from ibtrade import Trade, get_data_entry_trades, MAP_10_SEC
@@ -47,9 +48,22 @@ LMT_TIME_IN_FORCE = 'FOK'
 # The time-in-force option used when placing limit orders.
 # Default 'FOK' (Fill-or-Kill)
 
+LMT_ORDER_OPEN_TIMEOUT = 60*3
+# The amount of time to wait before failing
+# an opening trade for taking too long to open.
+
+MAX_ORDER_ERRORS = 4
+# The # of failed orders on a trade before locking it down (safety precaution)
+
 STK_NBBO_OFFSET = 0.02
-# The $ away from the NBBO to aggressively move stock order around until it fills.
+# The $ away from the NBBO to aggressively move price around until it fills.
 # NOTE: Only applies of USE_LMT_ORDERS is True
+
+
+STK_NBBO_LIMIT = 0.05
+# The % below or above the current market price to place the order CAP on a PEG MID order.
+# NOTE: Only applies if USE_LIMIT_ORDERS is True
+# NOTE: Only applies when Trade.sec_type = 'STK'
 
 EVAL_ORDER_PAUSE_MINUTES = 5
 # The # of minutes to pause between evaluations when a trade has had an order placed.
@@ -96,7 +110,9 @@ Base = declarative_base()
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-engine = create_engine("sqlite:///" + DB_PATH, echo=False)
+engine = create_engine("sqlite:///" + DB_PATH,
+                       echo=False,
+                       connect_args={'check_same_thread': False})
 Session = scoped_session(sessionmaker(bind=engine))
 
 
@@ -338,6 +354,11 @@ class IbTrade(Base):
                 and order.exclude == 0]
 
     @hybrid_method
+    def get_orders_errored(self):
+        return [o for o in self.orders
+                if o.status == OrderStatus.ERROR]
+
+    @hybrid_method
     def get_target_and_stop_orders(self, session) -> (list, list):
         """
         Returns a list of target order/executions and a list of stop order/executions.
@@ -408,6 +429,48 @@ class IbTrade(Base):
             return idx, self.stop_prices[idx]
         except IndexError:
             return None, None
+
+    @hybrid_method
+    def register_order(self, session, ib_app, action, qty='total_qty', force_market_order=False):
+
+        # Prevent more than X failed orders.
+        order_errors = len(self.get_orders_errored())
+        if order_errors >= MAX_ORDER_ERRORS:
+            msg = IbTradeMessage()
+            msg.text = "Failed {} orders (the max) on this trade. Needs investigation.".format(order_errors)
+            msg.error_code = 99996
+            return register_trade_msg(self, msg, update_gsheet=True)
+
+        # 'Safe' to register order
+        tif = None
+        offset = None
+        contract_price = None
+        order_type = 'MKT'
+
+        if isinstance(qty, str):
+            qty = getattr(self, qty)
+
+        if USE_LMT_ORDERS and not force_market_order:
+            contract_price = get_trade_limit_price(session, self, action, ib_app)
+
+            if self.sec_type in ('BAG', 'OPT') and abs(contract_price) < 0.10:
+                # Option prices under 0.10 are 'worthless' and must be market orders.
+                contract_price = None
+            else:
+                order_type = 'LMT'
+                if 'STK' == self.sec_type:
+                    tif = 'PEG MID'
+                    difference = round((STK_NBBO_LIMIT * contract_price), 2)
+                    if action == 'SELL':
+                        difference = -difference
+                    contract_price += difference
+
+        register_order(session, self, action, qty,
+                       status=OrderStatus.READY,
+                       tif=tif,
+                       price=contract_price,
+                       type=order_type,
+                       offset=offset)
 
     def __repr__(self):
         return "<IbTrade(con_id='{}', ul_entry='{}', target1='{}', stop1='{}', entry_price='{}', " \
@@ -772,6 +835,12 @@ def call_with_session(func, *args):
     return result
 
 
+def close_order_thread(order_id):
+    thread = _THREADS.get(order_id, None)
+    if thread:
+        thread.STOP = True
+
+
 def delete_old_prices(session, minutes=20):
     condition = IbPrice.time < datetime.utcnow() - timedelta(minutes=minutes)
     session.query(IbPrice).filter(condition).delete(synchronize_session=False)
@@ -787,19 +856,11 @@ def delete_trade_legs(session, trade_id):
 
 def evaluate_trades(session, ib_app, outside_rth=False):
     """Creates an IbOrder for any trade that needs to be closed (partial or full)"""
-    order_time = datetime.utcnow() - timedelta(minutes=EVAL_ORDER_PAUSE_MINUTES)
-
     open_orders = session.query(IbOrder.trade_id).filter(
         IbOrder.status.in_(OrderStatus.PENDING_STATUSES)
     ).all()
 
-    recent_trades = session.query(IbOrder.trade_id).filter(
-        and_(IbOrder.date_filled > order_time,
-             IbOrder.exclude == 0)
-    ).all()
-
     trade_ids = [o.trade_id for o in open_orders]
-    trade_ids.extend([o.trade_id for o in recent_trades])
 
     trade_criteria = [
         IbTrade.date_exited.is_(None),
@@ -885,27 +946,9 @@ def evaluate_trades(session, ib_app, outside_rth=False):
         if action and qty and mkt_open:
             if abs(qty) > abs(left):
                 qty = left
-            contract_price = None
-            tif = None
-            offset = None
             t.underlying_exit_price = price
-            
-            if USE_LMT_ORDERS and not force_market_close:
-                order_type = 'LMT'
-                if 'STK' == t.sec_type:
-                    tif = 'PEG MID'
-                    offset = STK_NBBO_OFFSET
-                else:
-                    contract_price = get_trade_limit_price(session, t, action, ib_app)
-            else:
-                order_type = 'MKT'
-
-            register_order(session, t, action, qty, 
-                           status=OrderStatus.READY, 
-                           tif=tif, 
-                           price=contract_price,
-                           type=order_type,
-                           offset=offset)
+            t.register_order(session, ib_app, action, qty=qty,
+                             force_market_order=force_market_close)
 
 
 def get_api_contract_by_contract_id(session, contract_id) -> (ibutils.Contract, None):
@@ -1065,7 +1108,11 @@ def get_trade_market_price(session, trade, ib_app, type='mid', timeout_seconds=6
     else:
         p = get_price_by_contract_id(session, trade.contract_id, min_seconds=60)
         if p is None:
-            sub, p = register_market_data_subscription(session, trade.gsheet_trade.get_contract(), ib_app)
+            api_contract = trade.gsheet_trade.get_contract()
+            if api_contract is None:
+                sub, p = None, None
+            else:
+                sub, p = register_market_data_subscription(session, api_contract, ib_app)
             if p is None:
                 if raise_gsheet_error:
                     msg = IbTradeMessage()
@@ -1079,12 +1126,16 @@ def get_trade_market_price(session, trade, ib_app, type='mid', timeout_seconds=6
 
 
 def maybe_request_executions(session, ib_app):
+    last_request = CACHE_5_SEC.get('maybe_request_executions', None)
+    if last_request:
+        return
+
     orders = session.query(IbOrder).filter(IbOrder.status == OrderStatus.PLACED).all()
-    for order in orders:
-        execs = get_executions_by_order_id(session, order.request_id)
-        if not execs:
-            ib_app.request_executions()
-            break
+    if not orders:
+        return
+
+    CACHE_5_SEC['maybe_request_executions'] = True
+    ib_app.request_executions()
 
 
 def maybe_update_db_trade(session, sql_trade: IbTrade, sheet_trade):
@@ -1165,90 +1216,136 @@ def place_order(session, ib_app, order: IbOrder, peg_mid=True):
 _THREADS = dict()
 
 
-def process_pegged_order(ib_app, order, timeout=90):
-    thread = _THREADS.get(order.request_id, None)
-    if thread is None:
-        _THREADS[order.request_id] = thread = Thread(
-            target=_process_threaded_peg_order,
-            args=(Session, ib_app, order.request_id, timeout))
-        thread.start()
-    else:
+class IbOrderPeg(Thread):
+    def __init__(self, session_maker, ib_app, order_id, timeout=LMT_ORDER_OPEN_TIMEOUT):
+        self.Session = session_maker
+        self.ib_app = ib_app
+        self.order_id = order_id
+        self.timeout = timeout
+        self.STOP = False
+        self.start_time = None
+        Thread.__init__(self)
+
+    def run(self):
         try:
-            thread.join(0.05)
-        except TimeoutError:
-            return
-        else:
-            _THREADS.pop(order.request_id)
+            self._process_pegged_order(self.ib_app, self.order_id)
+        except Exception as e:
+            log.error("IbOrderPegError({})".format(e))
+            raise
+
+    def get_bump_factor(self, b_factor, increment=0.005):
+        secs = (datetime.utcnow() - self.start_time).total_seconds()
+        for i in (1, 2, 3, 4, 5):
+            if secs > 60*i:
+                b_factor += increment
+            else:
+                break
+        return b_factor
+
+    def _process_pegged_order(self, ib_app, order_id):
+        timeout_time = datetime.now() + timedelta(seconds=self.timeout)
+        log.debug("IbOrderPeg._process_pegged_order: request_id {}".format(order_id))
+
+        while timeout_time > datetime.now() and not self.STOP:
+            session = self.Session()
+            if not utils.get_market_options_open():
+                return False
+
+            order = session.query(IbOrder).filter(IbOrder.request_id == order_id).one()
+            if not order or order.status != OrderStatus.PLACED:
+                return False
+            if self.start_time is None:
+                self.start_time = order.date_added
+
+            # We want a filled order.
+            execs = order.get_valid_executions(get_executions_by_order_id(session, order.request_id))
+            filled = order.get_executed_qty(execs)
+
+            if filled >= order.qty:
+                return True
+
+            mid = get_trade_market_price(session, order.trade, ib_app, timeout_seconds=10, raise_gsheet_error=False)
+            # Attempt to make BAG trades fill with a 1% higher limit price.
+
+            if not mid:
+                log.debug("process_pegged_order: {} - missing pricing.".format(order.contract_id))
+                sleep(2.5)
+                continue
+
+            is_bag = '/BAG/' in order.contract_id
+
+            if is_bag:
+                b_factor = self.get_bump_factor(0.025)
+                if order.price < 0:
+                    bump = -b_factor if 'BUY' == order.action else b_factor
+                else:
+                    bump = b_factor if 'BUY' == order.action else -b_factor
+                mid = round(mid + (bump * mid), 2)
+            else:
+                b_factor = self.get_bump_factor(0.0)
+                bump = b_factor if 'BUY' == order.action else -b_factor
+                mid = round(mid + (bump * mid), 2)
+
+            # Replace order price to mid if it increases the odds of a fill.
+            needs_replacement = (abs(abs(order.price) - abs(mid)) > .02) and \
+                                ((order.action == 'BUY' and order.price < mid) or
+                                 (order.action == 'SELL' and order.price > mid))
+
+            if needs_replacement:
+                log.debug("process_pegged_order: Replacing price {} with {}".format(order.price, mid))
+                order.price = mid
+                session.commit()
+                place_order(session, ib_app, order)
+
+            session.commit()
+            session.close()
+            sleep(5)
+
+        # Fail the trade or try again.
+        session = self.Session()
+        order = session.query(IbOrder).filter(IbOrder.request_id == order_id).one()
+        if order and order.trade and not self.STOP:
+            execs = get_executions_by_order_id(session, order.request_id)
+            fail_order = (not execs and
+                          not order.trade.has_opening_order_complete and
+                          not 'BAG' == order.trade.sec_type)
+            if fail_order:
+                msg = IbTradeMessage()
+                msg.status = MsgStatus.OPEN
+                msg.error_code = 99991
+                msg.text = "Order peg-to-mid timeout - reset trade & try again."
+                register_trade_msg(order.trade, msg, update_gsheet=True)
+                register_forced_trade_close(session, order.trade, exclude=1)
+                order.status = OrderStatus.ERROR
+                ib_app.cancelOrder(order.request_id)
+                session.commit()
+            else:
+                # Chase the partial or closing trade trade until complete.
+                log.debug("Retrying order: {}".format(order))
+                session.close()
+                return self._process_pegged_order(ib_app, order.request_id)
+        session.close()
+
+        # Trade is failed
+        return False
 
 
-def _process_threaded_peg_order(Session, ib_app, order_id, timeout=90):
-    session = Session()
-    order = session.query(IbOrder).filter(IbOrder.request_id == order_id).one()
+def process_pegged_order(ib_app, order, timeout=LMT_ORDER_OPEN_TIMEOUT):
+    thread = _THREADS.get(order.request_id, None)
+
+    if thread is None:
+        thread = IbOrderPeg(
+            Session, ib_app, order.request_id, timeout)
+        _THREADS[order.request_id] = thread
+        thread.start()
+        return
 
     try:
-        done = _process_pegged_order(session, ib_app, order, timeout)
-    except Exception as e:
-        log.error(e)
-        session.rollback()
-    else:
-        session.commit()
-        session.close()
-        return done
-
-
-def _process_pegged_order(session, ib_app, order: IbOrder, timeout=90):
-    timeout_time = datetime.now() + timedelta(seconds=timeout)
-    session.commit()
-    log.debug("process_pegged_order: {} - need {}".format(order.contract_id, order.qty))
-    while timeout_time > datetime.now():
-        if not utils.get_market_options_open():
-            return False
-        if order.status != OrderStatus.PLACED:
-            return False
-
-        ib_app.request_executions()
-        # We want a filled order.
-        execs = order.get_valid_executions(get_executions_by_order_id(session, order.request_id))
-        filled = order.get_executed_qty(execs)
-
-        if filled >= order.qty:
-            return True
-
-        mid = get_trade_market_price(session, order.trade, ib_app, timeout_seconds=10, raise_gsheet_error=False)
-
-        if mid is None:
-            log.debug("process_pegged_order: {} - missing pricing.".format(order.contract_id))
-            sleep(2.5)
-            continue
-
-        # Maybe replace order to mid.
-        needs_replacement = abs(abs(order.price) - abs(mid)) > STK_NBBO_OFFSET
-
-        if needs_replacement:
-            log.debug("process_pegged_order: Replacing price {} with {}".format(order.price, mid))
-            order.price = mid
-            session.commit()
-            place_order(session, ib_app, order)
-        session.expire(order)
-        sleep(5)
-
-    if order.trade:
-        execs = get_executions_by_order_id(session, order.request_id)
-        if not execs and not order.trade.has_opening_order_complete:
-            msg = IbTradeMessage()
-            msg.status = MsgStatus.OPEN
-            msg.error_code = 99991
-            msg.text = "Order peg-to-mid timeout - reset trade & try again."
-            register_trade_msg(order.trade, msg, update_gsheet=True)
-            register_forced_trade_close(session, order.trade, exclude=1)
-            order.status = OrderStatus.ERROR
-            ib_app.cancelOrder(order.request_id)
-        else:
-            # Chase the partial or closing trade trade until complete.
-            log.debug("Retrying order: {}".format(order))
-            return _process_pegged_order(session, ib_app, order,)
-
-    return False
+        thread.join(0.05)
+        thread.STOP = True
+        _THREADS.pop(order.request_id)
+    except TimeoutError:
+        return
 
 
 def process_trade_messages(session, ib_app):
@@ -1256,7 +1353,7 @@ def process_trade_messages(session, ib_app):
         and_(IbTradeMessage.status == MsgStatus.OPEN,
              IbTradeMessage.error_code > 0)
     ).join(IbTrade).filter(
-        IbTrade.status.notin_([TradeStatus.CLOSED, TradeStatus.ERROR])
+        IbTrade.status.notin_([TradeStatus.CLOSED])
     ).all()
 
     if not msgs:
@@ -1327,11 +1424,14 @@ def process_trade_messages(session, ib_app):
 
         if highlight_trade:
             row = ibtrade.get_sheet_row_by_uid(trade.u_id)
-            highlighted = ibtrade.highlight_cell(
-                u_id=None,
-                col_number=4,  # Tactic S or O
-                row_idx=row,
-                bg_color='red')
+            if row:
+                highlighted = ibtrade.highlight_cell(
+                    u_id=None,
+                    col_number=4,  # Tactic S or O
+                    row_idx=row,
+                    bg_color='red')
+            else:
+                highlighted = False
             if not highlighted:
                 log.error("Failed to highlight UID {}".format(trade.u_id))
 
@@ -1762,26 +1862,7 @@ def sync_opening_orders(session, ib_app):
         if not t.has_valid_legs:
             continue
         action = 'SELL' if t.is_short else 'BUY'
-        contract_price = None
-        tif = None
-        offset = None
-
-        if USE_LMT_ORDERS:
-            order_type = 'LMT'
-            if 'STK' == t.sec_type:
-                tif = 'PEG MID'
-                offset = STK_NBBO_OFFSET
-            else:
-                contract_price = get_trade_limit_price(session, t, action, ib_app)
-        else:
-            order_type = 'MKT'
-
-        register_order(session, t, action, t.total_qty,
-                       status=OrderStatus.READY,
-                       tif=tif,
-                       price=contract_price,
-                       type=order_type,
-                       offset=offset)
+        t.register_order(session, ib_app, action, qty='total_qty')
 
 
 def sync_positions(session):
@@ -1848,7 +1929,6 @@ def sync_positions(session):
                     qty = t.sold_qty - total_qty
 
             if action:
-                t.status = TradeStatus.ERROR
                 msg_text = "programming error: {} position size is off by {}".format(t.contract_id, qty)
                 msg = IbTradeMessage()
                 msg.error_code = 99994
@@ -1924,11 +2004,11 @@ def sync_pre_check_trades(session, ib_app):
         if trade.sec_type == 'BAG':
             check_size = abs(check_size)
 
-        if check_size != trade.size:
+        if abs(check_size) != abs(trade.size):
             log.debug(
                 "sync_pre_check_trades: Update size from {} to {} on {}".format(trade.size, check_size, trade))
             trade.size = check_size
-            ibtrade.set_new_trade_size(trade.u_id, check_size)
+            ibtrade.set_new_trade_size(trade.u_id, abs(check_size))
 
     session.commit()
 
@@ -1970,28 +2050,25 @@ def sync_price_subscriptions(session, ib_app):
 
 
 def sync_timed_out_orders(session):
-    mins_to_mkt = utils.get_minutes_to_market_open()
-    if mins_to_mkt > 0:
-        return  # Don't process outside of market hours.
-    elif 0 > mins_to_mkt > -30:
-        return   # Allow ~30 mins of market time to fill open orders.
+    mkt_hours = utils.get_market_options_open()
+    if not mkt_hours:
+        return
 
-    # TODO: We have the opportunity to replace timed out orders
-    # Since we're identifying them here. Make a process for this.
-    # When order.type == 'LMT': Cancel/replace @ new current price.
     orders = session.query(IbOrder).filter(
         and_(IbOrder.status.in_(OrderStatus.PENDING_STATUSES),
              IbOrder.date_added < datetime.utcnow() - timedelta(minutes=15))
     ).all()
 
     for order in orders:
-        order.status = OrderStatus.ERROR
         trade = order.trade
+        dont_cancel = (trade is None or                        # Forced order (no linked trade)
+                       trade.has_opening_order_complete or     # Closing/exit order
+                       trade.sec_type == 'BAG')                # BAG trades take a long time.
 
-        # Avoid timing out forced & exit trades.
-        if trade is None or trade.has_opening_order_complete:
+        if dont_cancel:
             continue
 
+        order.status = OrderStatus.ERROR
         msg = IbTradeMessage()
         msg.error_code = 99991
         msg.text = "Order failed to execute (or register execution) within 15 minutes."
@@ -2005,16 +2082,15 @@ def sync_timed_out_orders(session):
 def sync_fills(session):
     """Processes IbOrders from PLACED to COMPLETE, updating GSheet/IbTrade with details from IbExecutions."""
     orders = session.query(IbOrder).filter(IbOrder.status == OrderStatus.PLACED).all()
-    for order in orders:
-        log.debug("sync_fills: {}".format(order))
+    if not orders:
+        return
+    log.debug("sync_fills: {} placed orders.".format(len(orders)))
 
+    for order in orders:
         all_execs = get_executions_by_order_id(session, order.request_id)
         execs = order.get_valid_executions(all_execs)
         qty = order.get_executed_qty(execs)
-        # log.debug("# of executions: {}".format(len(execs)))
-        # log.debug("exec qty: {}".format(qty))
         if abs(qty) < abs(order.qty):
-            log.debug("Skipping partially-filled order.".format(order.contract_id, len(execs), qty))
             continue
 
         price = order.get_executed_price(execs)
@@ -2032,6 +2108,7 @@ def sync_fills(session):
         if db_trade is None:
             order.status = OrderStatus.COMPLETE
             order.date_filled = now_utc
+            order.price = price
             continue
 
         now_est = utils.utc_to_est(now_utc).strftime(ibtrade.SHEET_TIME_FMT)
@@ -2054,7 +2131,7 @@ def sync_fills(session):
                 attrs['exit_price'] = price
                 attrs['notes'] = ibtrade.TGT_REACHED if price > db_trade.entry_price else ibtrade.STOP_LOSS
                 if db_trade.sec_type == 'BAG':
-                    if db_trade.entry_price < 0:
+                    if db_trade.original_entry_price and db_trade.original_entry_price < 0:
                         # credit entry / debit exit
                         if abs(price) > abs(db_trade.entry_price):
                             attrs['notes'] = ibtrade.STOP_LOSS
@@ -2084,11 +2161,12 @@ def sync_fills(session):
                 attrs['date_exited'] = now_est
                 attrs['exit_price'] = -price
                 attrs['notes'] = ibtrade.TGT_REACHED if price < db_trade.entry_price else ibtrade.STOP_LOSS
-        log.info("closing attributes: {}".format(attrs))
+
+        log.info("order details: {}".format(attrs))
 
         # Update GSheet
         if attrs['is_partial']:
-            log.debug("Closing partial")
+            log.debug("Closing partial: {}".format(db_trade.contract_id))
             sheet_trade_partial = ibtrade.close_sheet_trade_partial(
                 db_trade.u_id, attrs['pct_sold'], attrs['exit_price'],
                 attrs['date_exited'], attrs['notes'])
@@ -2098,7 +2176,7 @@ def sync_fills(session):
         else:
 
             if attrs['date_exited']:
-                log.debug("Closing trade.")
+                log.debug("Closing trade: {}".format(db_trade.contract_id))
                 u_id = ibtrade.close_sheet_trade(
                     db_trade.u_id, attrs['pct_sold'], attrs['exit_price'],
                     attrs['date_exited'], attrs['notes'])
@@ -2107,7 +2185,7 @@ def sync_fills(session):
                 db_trade.date_exited = now_utc
                 db_trade.status = TradeStatus.CLOSED
             else:
-                log.debug("Opening trade.")
+                log.debug("Opening trade: {}".format(db_trade.contract_id))
                 ibtrade.open_sheet_trade(
                     db_trade.u_id,
                     attrs['entry_price'],
@@ -2241,7 +2319,8 @@ def _get_price_data_import(contract: ibutils.Contract, data: dict):
 
     CACHE_1_SEC[throttle_key] = True
     last_mid = MAP_10_SEC.get(throttle_key, None)
-    MAP_10_SEC[throttle_key] = mid_time = min(bid_time, ask_time)
+    mid_time = min(bid_time, ask_time)
+    MAP_10_SEC[throttle_key] = mid_time
 
     if mid_time == last_mid:
         mid_time = datetime.utcnow()
@@ -2308,19 +2387,19 @@ def _register_trade_from_trade_obj(session, trade: Trade) -> IbTrade:
         if t.original_entry_price:
             t.original_entry_price = -abs(t.original_entry_price)
 
-    if not trade.valid:
-        t.status = TradeStatus.ERROR
+    if not trade.valid or trade.get_contract() is None:
         msg = IbTradeMessage()
         msg.text = "Error parsing TACTIC."
         msg.error_code = 99995
         t.messages.append(msg)
+        t.status = TradeStatus.ERROR
     else:
         t.status = TradeStatus.PRE_OPEN_CHECK
 
     session.add(t)
     session.commit()
 
-    if t.status != TradeStatus.ERROR:
+    if t.status == TradeStatus.PRE_OPEN_CHECK:
         contract1 = trade.get_contract()
         register_contract(session, contract1, trade=t)
         if contract1.secType != 'STK':
@@ -2500,6 +2579,8 @@ class IbDbApp(IbApp):
             return
         if error_code == 300:
             return
+        if error_code == ib.CODE_ORDER_CANT_MODIFY_FILLED:
+            return close_order_thread(error_id)
 
         data = {'type': 'error',
                 'error_code': error_code,
